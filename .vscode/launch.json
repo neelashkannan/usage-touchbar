@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:usage-touchbar}",
+            "name": "Debug usage-touchbar",
+            "target": "usage-touchbar",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug usage-touchbar"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:usage-touchbar}",
+            "name": "Release usage-touchbar",
+            "target": "usage-touchbar",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release usage-touchbar"
+        }
+    ]
+}

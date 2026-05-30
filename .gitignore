@@ -1,0 +1,20 @@
+# Vibe coding / assistant metadata
+agents.md
+AGENTS.md
+claude.md
+Claude.md
+copilot.md
+COPILOT.md
+.github/copilot.md
+.github/COPILOT.md
+.github/copilot/**
+.github/Copilot/**
+.copilot/**
+.claude/**
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
