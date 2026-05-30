@@ -193,178 +193,265 @@ final class UsageStore: @unchecked Sendable {
     }
 }
 
-struct LocalLogCollector: UsageCollecting {
-    let provider: Provider
-    let candidatePaths: [String]
-    let keywords: [String]
-    private let maxBytesPerFile = 512 * 1024
-
-    func collect() async -> UsageSnapshot {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let expandedPaths = candidatePaths.map { $0.replacingOccurrences(of: "~", with: home) }
-        let files = expandedPaths.flatMap { path in
-            recentFiles(at: path, limit: 80)
-        }
-
-        guard !files.isEmpty else {
-            return UsageSnapshot(
-                provider: provider,
-                primaryText: "No data",
-                detailText: "No local usage files found",
-                warningText: nil,
-                updatedAt: Date(),
-                source: expandedPaths.joined(separator: ", "),
-                error: "Configure the usage data path once the provider source is confirmed."
-            )
-        }
-
-        var requestCount = 0
-        var tokenCount = 0
-        var latestDate = Date.distantPast
-
-        for file in files {
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
-               let modified = attributes[.modificationDate] as? Date {
-                latestDate = max(latestDate, modified)
-            }
-
-            guard let text = readPrefix(from: file) else {
-                continue
-            }
-
-            requestCount += countUsageHints(in: text)
-            tokenCount += extractTokenHints(from: text)
-        }
-
-        let primary: String
-        let detail: String
-        if tokenCount > 0 {
-            primary = Self.format(tokenCount) + " tokens"
-            detail = "\(requestCount) events"
-        } else if requestCount > 0 {
-            primary = "\(requestCount) events"
-            detail = "Token totals unavailable"
-        } else {
-            primary = "Files found"
-            detail = "No usage counters detected"
-        }
-
-        return UsageSnapshot(
-            provider: provider,
-            primaryText: primary,
-            detailText: detail,
-            warningText: nil,
-            updatedAt: latestDate == Date.distantPast ? Date() : latestDate,
-            source: files.first?.deletingLastPathComponent().path ?? expandedPaths.joined(separator: ", "),
-            error: nil
-        )
+/// Shared helpers for locating and reading provider data files.
+enum DataFiles {
+    static func home() -> String {
+        FileManager.default.homeDirectoryForCurrentUser.path
     }
 
-    private func recentFiles(at path: String, limit: Int) -> [URL] {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+    static func expand(_ path: String) -> String {
+        path.replacingOccurrences(of: "~", with: home())
+    }
+
+    /// Returns regular files under `directory` (recursively) sorted newest first.
+    static func recentFiles(
+        in directory: String,
+        extensions: Set<String>,
+        modifiedAfter: Date? = nil,
+        maxInspected: Int = 5_000
+    ) -> [URL] {
+        let root = URL(fileURLWithPath: directory)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory, isDirectory: &isDir), isDir.boolValue else {
             return []
         }
 
-        if !isDirectory.boolValue {
-            return [URL(fileURLWithPath: path)]
-        }
-
         guard let enumerator = FileManager.default.enumerator(
-            at: URL(fileURLWithPath: path),
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .isDirectoryKey],
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else {
             return []
         }
 
+        var matches: [(URL, Date)] = []
         var inspected = 0
-        var files: [URL] = []
-
         for case let url as URL in enumerator {
             inspected += 1
-            if inspected > 1_000 || files.count >= limit * 2 {
-                break
-            }
-
-            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
-            if values?.isDirectory == true {
-                let name = url.lastPathComponent.lowercased()
-                if ["cache", "caches", "node_modules", "tmp", "temp"].contains(name) {
-                    enumerator.skipDescendants()
-                }
-                continue
-            }
-
-            let allowed = ["json", "jsonl", "log", "txt"].contains(url.pathExtension.lowercased())
-            if allowed && values?.isRegularFile == true {
-                files.append(url)
-            }
+            if inspected > maxInspected { break }
+            guard extensions.contains(url.pathExtension.lowercased()) else { continue }
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true else { continue }
+            let modified = values?.contentModificationDate ?? .distantPast
+            if let cutoff = modifiedAfter, modified < cutoff { continue }
+            matches.append((url, modified))
         }
 
-        return files
-            .sorted { lhs, rhs in
-                let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return left > right
-            }
-            .prefix(limit)
-            .map { $0 }
+        return matches.sorted { $0.1 > $1.1 }.map { $0.0 }
     }
 
-    private func readPrefix(from file: URL) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: file) else {
-            return nil
-        }
+    /// Streams a file line by line without loading the whole file into memory.
+    static func forEachLine(in url: URL, _ body: (String) -> Void) {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
 
-        let data = handle.readData(ofLength: maxBytesPerFile)
-        return String(data: data, encoding: .utf8)
-    }
-
-    private func countUsageHints(in text: String) -> Int {
-        let lowercased = text.lowercased()
-        let explicitHits = keywords.reduce(0) { count, keyword in
-            count + lowercased.components(separatedBy: keyword.lowercased()).count - 1
-        }
-
-        if explicitHits > 0 {
-            return explicitHits
-        }
-
-        return text.split(separator: "\n").filter { line in
-            let lower = line.lowercased()
-            return lower.contains("model") || lower.contains("tokens") || lower.contains("completion")
-        }.count
-    }
-
-    private func extractTokenHints(from text: String) -> Int {
-        let patterns = [
-            #""(?:total_tokens|tokens|input_tokens|output_tokens)"\s*:\s*(\d+)"#,
-            #"(?i)(?:total tokens|tokens|input tokens|output tokens)[^0-9]{0,24}(\d+)"#
-        ]
-
-        return patterns.reduce(0) { total, pattern in
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { return total }
-            let range = NSRange(text.startIndex..<text.endIndex, in: text)
-            return total + regex.matches(in: text, range: range).reduce(0) { subtotal, match in
-                guard let valueRange = Range(match.range(at: 1), in: text),
-                      let value = Int(text[valueRange]) else {
-                    return subtotal
+        var buffer = Data()
+        let newline = UInt8(ascii: "\n")
+        while autoreleasepool(invoking: {
+            let chunk = handle.readData(ofLength: 256 * 1024)
+            if chunk.isEmpty { return false }
+            buffer.append(chunk)
+            while let index = buffer.firstIndex(of: newline) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<index)
+                buffer.removeSubrange(buffer.startIndex...index)
+                if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                    body(line)
                 }
-                return subtotal + value
+            }
+            return true
+        }) {}
+
+        if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8), !line.isEmpty {
+            body(line)
+        }
+    }
+}
+
+/// Reads Codex's real rate-limit + token telemetry from its session rollout files.
+///
+/// Codex writes `token_count` events into `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`.
+/// Each event carries `rate_limits.primary` (5-hour window) and `rate_limits.secondary`
+/// (weekly window) with `used_percent` + `resets_at`, plus cumulative token totals.
+struct CodexUsageCollector: UsageCollecting {
+    let provider: Provider = .codex
+
+    private struct Window: Decodable {
+        let used_percent: Double
+        let resets_at: Double?
+    }
+    private struct RateLimits: Decodable {
+        let primary: Window?
+        let secondary: Window?
+        let plan_type: String?
+    }
+    private struct TokenUsage: Decodable {
+        let total_tokens: Int?
+    }
+    private struct Info: Decodable {
+        let total_token_usage: TokenUsage?
+    }
+    private struct TokenCountPayload: Decodable {
+        let type: String
+        let info: Info?
+        let rate_limits: RateLimits?
+    }
+    private struct Event: Decodable {
+        let timestamp: String?
+        let payload: TokenCountPayload?
+    }
+
+    func collect() async -> UsageSnapshot {
+        guard AuthDetector.current().isConnected(.codex) else {
+            return .disconnected(.codex)
+        }
+
+        let sessionsDir = DataFiles.expand("~/.codex/sessions")
+        let files = DataFiles.recentFiles(in: sessionsDir, extensions: ["jsonl"]).prefix(12)
+        guard !files.isEmpty else {
+            return .failure(.codex, message: "No Codex sessions found")
+        }
+
+        let decoder = JSONDecoder()
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        var best: (date: Date, event: TokenCountPayload)?
+
+        // The most recently modified rollout holds the freshest account-wide
+        // rate limits; scan a few in case the newest has no token_count yet.
+        for file in files {
+            DataFiles.forEachLine(in: file) { line in
+                guard line.contains("\"token_count\"") else { return }
+                guard let data = line.data(using: .utf8),
+                      let event = try? decoder.decode(Event.self, from: data),
+                      let payload = event.payload, payload.type == "token_count",
+                      payload.rate_limits != nil else { return }
+                let date = event.timestamp.flatMap { isoFormatter.date(from: $0) } ?? Date.distantPast
+                if best == nil || date > best!.date {
+                    best = (date, payload)
+                }
+            }
+            if best != nil { break }
+        }
+
+        guard let result = best, let limits = result.event.rate_limits else {
+            return .failure(.codex, message: "No usage telemetry yet")
+        }
+
+        return UsageSnapshot(
+            provider: .codex,
+            isConnected: true,
+            dailyPercent: limits.primary?.used_percent,
+            weeklyPercent: limits.secondary?.used_percent,
+            dailyResetAt: limits.primary?.resets_at.map { Date(timeIntervalSince1970: $0) },
+            weeklyResetAt: limits.secondary?.resets_at.map { Date(timeIntervalSince1970: $0) },
+            totalTokens: result.event.info?.total_token_usage?.total_tokens,
+            planLabel: limits.plan_type.map { $0.capitalized },
+            updatedAt: result.date == .distantPast ? Date() : result.date,
+            error: nil
+        )
+    }
+}
+
+/// Reads Claude Code's real token usage from its session transcripts.
+///
+/// Claude Code does not expose a rate-limit percentage, so usage is derived from
+/// the actual per-message `usage` totals in `~/.claude/projects/**/*.jsonl`,
+/// aggregated over the rolling 5-hour and 7-day limit windows. Percentages are an
+/// estimate against the token budgets below; tweak them to match your plan.
+struct ClaudeUsageCollector: UsageCollecting {
+    let provider: Provider = .claude
+
+    /// Approximate token budgets for the rolling windows. These are estimates
+    /// (Claude does not publish exact figures); adjust to fit your plan.
+    var fiveHourTokenBudget = 19_000_000
+    var weeklyTokenBudget = 200_000_000
+
+    private struct Usage: Decodable {
+        let input_tokens: Int?
+        let output_tokens: Int?
+        let cache_creation_input_tokens: Int?
+    }
+    private struct Message: Decodable {
+        let usage: Usage?
+    }
+    private struct Line: Decodable {
+        let type: String?
+        let timestamp: String?
+        let message: Message?
+    }
+
+    func collect() async -> UsageSnapshot {
+        guard AuthDetector.current().isConnected(.claude) else {
+            return .disconnected(.claude)
+        }
+
+        let projectsDir = DataFiles.expand("~/.claude/projects")
+        let now = Date()
+        let weekAgo = now.addingTimeInterval(-7 * 24 * 3600)
+        let fiveHoursAgo = now.addingTimeInterval(-5 * 3600)
+
+        let files = DataFiles.recentFiles(in: projectsDir, extensions: ["jsonl"], modifiedAfter: weekAgo)
+        guard !files.isEmpty else {
+            return .failure(.claude, message: "No recent Claude sessions")
+        }
+
+        let decoder = JSONDecoder()
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        var fiveHourTokens = 0
+        var weeklyTokens = 0
+        var oldestInWindow: Date?
+        var latest = Date.distantPast
+
+        for file in files {
+            DataFiles.forEachLine(in: file) { line in
+                guard line.contains("\"usage\"") else { return }
+                guard let data = line.data(using: .utf8),
+                      let parsed = try? decoder.decode(Line.self, from: data),
+                      parsed.type == "assistant",
+                      let usage = parsed.message?.usage,
+                      let stamp = parsed.timestamp,
+                      let date = isoFormatter.date(from: stamp) else { return }
+
+                let tokens = (usage.input_tokens ?? 0)
+                    + (usage.output_tokens ?? 0)
+                    + (usage.cache_creation_input_tokens ?? 0)
+                guard tokens > 0 else { return }
+
+                if date >= weekAgo {
+                    weeklyTokens += tokens
+                    latest = max(latest, date)
+                }
+                if date >= fiveHoursAgo {
+                    fiveHourTokens += tokens
+                    if oldestInWindow == nil || date < oldestInWindow! {
+                        oldestInWindow = date
+                    }
+                }
             }
         }
-    }
 
-    private static func format(_ value: Int) -> String {
-        if value >= 1_000_000 {
-            return String(format: "%.1fM", Double(value) / 1_000_000)
+        guard weeklyTokens > 0 else {
+            return .failure(.claude, message: "No usage in the last 7 days")
         }
-        if value >= 1_000 {
-            return String(format: "%.1fK", Double(value) / 1_000)
-        }
-        return "\(value)"
+
+        let dailyPercent = min(100, Double(fiveHourTokens) / Double(fiveHourTokenBudget) * 100)
+        let weeklyPercent = min(100, Double(weeklyTokens) / Double(weeklyTokenBudget) * 100)
+
+        return UsageSnapshot(
+            provider: .claude,
+            isConnected: true,
+            dailyPercent: dailyPercent,
+            weeklyPercent: weeklyPercent,
+            dailyResetAt: oldestInWindow?.addingTimeInterval(5 * 3600),
+            weeklyResetAt: nil,
+            totalTokens: weeklyTokens,
+            planLabel: nil,
+            updatedAt: latest == .distantPast ? now : latest,
+            error: nil
+        )
     }
 }
 
@@ -581,6 +668,68 @@ final class ProviderLogoView: NSView {
     }
 }
 
+/// A compact labelled progress bar: `caption  ▓▓▓▓░░░  42%`.
+final class UsageBarView: NSView {
+    private let caption: String
+    private let percent: Double?
+    private let trailing: String
+
+    init(caption: String, percent: Double?, trailing: String) {
+        self.caption = caption
+        self.percent = percent
+        self.trailing = trailing
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 210, height: 20) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let captionAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let valueAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        let captionSize = caption.size(withAttributes: captionAttrs)
+        caption.draw(at: NSPoint(x: 0, y: (bounds.height - captionSize.height) / 2), withAttributes: captionAttrs)
+
+        let valueSize = trailing.size(withAttributes: valueAttrs)
+        trailing.draw(
+            at: NSPoint(x: bounds.maxX - valueSize.width, y: (bounds.height - valueSize.height) / 2),
+            withAttributes: valueAttrs
+        )
+
+        let captionWidth: CGFloat = 30
+        let barX = captionWidth + 6
+        let barWidth = bounds.maxX - valueSize.width - 8 - barX
+        guard barWidth > 8 else { return }
+
+        let barHeight: CGFloat = 7
+        let barRect = NSRect(x: barX, y: (bounds.height - barHeight) / 2, width: barWidth, height: barHeight)
+        let track = NSBezierPath(roundedRect: barRect, xRadius: barHeight / 2, yRadius: barHeight / 2)
+        NSColor(white: 0.32, alpha: 1).setFill()
+        track.fill()
+
+        guard let percent else { return }
+        let clamped = max(0, min(100, percent))
+        let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
+        let fillRect = NSRect(x: barX, y: barRect.minY, width: fillWidth, height: barHeight)
+        let fill = NSBezierPath(roundedRect: fillRect, xRadius: barHeight / 2, yRadius: barHeight / 2)
+        UsageFormat.color(forPercent: clamped).setFill()
+        fill.fill()
+    }
+}
+
 @MainActor
 final class TouchBarController: NSObject, NSTouchBarDelegate {
     static let codexIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.codex")
@@ -692,7 +841,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func configurePopover() {
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 360, height: 190)
+        popover.contentSize = NSSize(width: 380, height: 240)
         popover.contentViewController = UsageViewController(store: store)
     }
 
@@ -734,39 +883,66 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func makeDetailView() -> NSView {
         let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
-        let usage = UsagePresenter.usage(
-            for: selectedProvider,
-            snapshot: snapshots[selectedProvider],
-            authState: authState
-        )
+        let snapshot = snapshots[selectedProvider]
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 230, height: 64))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 70))
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(white: 0.84, alpha: 1).cgColor
-        container.layer?.cornerRadius = 4
+        container.layer?.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor
+        container.layer?.cornerRadius = 7
 
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.distribution = .gravityAreas
-        stack.spacing = 3
+        stack.spacing = 2
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        stack.addArrangedSubview(label("\(usage.provider.symbol) : \(usage.usageLine)", color: .secondaryLabelColor, bold: false, size: 11))
-        stack.addArrangedSubview(label(usage.resetLine, color: .secondaryLabelColor, bold: false, size: 11))
-        stack.addArrangedSubview(label(usage.weeklyLine, color: .secondaryLabelColor, bold: false, size: 11))
+        // Header: provider name + plan / status.
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.alignment = .firstBaseline
+        header.spacing = 6
+        let name = label(selectedProvider.symbol, color: selectedProvider.accentColor, bold: true, size: 12)
+        header.addArrangedSubview(name)
+        if let plan = snapshot?.planLabel {
+            header.addArrangedSubview(label(plan, color: .tertiaryLabelColor, bold: false, size: 9))
+        }
+        stack.addArrangedSubview(header)
+
+        if let snapshot, snapshot.error == nil {
+            let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
+            stack.addArrangedSubview(bar(
+                caption: "5h",
+                percent: snapshot.dailyPercent,
+                trailing: "\(UsageFormat.percentText(snapshot.dailyPercent))  ·  \(reset)"
+            ))
+            stack.addArrangedSubview(bar(
+                caption: "Wk",
+                percent: snapshot.weeklyPercent,
+                trailing: UsageFormat.percentText(snapshot.weeklyPercent)
+            ))
+        } else {
+            let message = snapshot?.error ?? "Loading…"
+            stack.addArrangedSubview(label(message, color: .systemOrange, bold: false, size: 10))
+        }
 
         container.addSubview(stack)
         NSLayoutConstraint.activate([
-            container.widthAnchor.constraint(equalToConstant: 230),
-            container.heightAnchor.constraint(equalToConstant: 64),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 5),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -5),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 5),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -5)
+            container.widthAnchor.constraint(equalToConstant: 250),
+            container.heightAnchor.constraint(equalToConstant: 70),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor)
         ])
 
         return container
+    }
+
+    private func bar(caption: String, percent: Double?, trailing: String) -> UsageBarView {
+        let view = UsageBarView(caption: caption, percent: percent, trailing: trailing)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: 230).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        return view
     }
 
     private func label(_ text: String, color: NSColor, bold: Bool, size: CGFloat) -> NSTextField {
@@ -789,7 +965,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private func statusTitle() -> String {
         let snapshots = store.currentSnapshots()
         guard !snapshots.isEmpty else { return "Usage" }
-        return snapshots.map { "\($0.provider.symbol): \($0.primaryText)" }.joined(separator: "  ")
+        let parts = snapshots.map { snapshot -> String in
+            if snapshot.error != nil { return "\(snapshot.provider.symbol) –" }
+            return "\(snapshot.provider.symbol) \(UsageFormat.percentText(snapshot.dailyPercent))"
+        }
+        return parts.joined(separator: "  ")
     }
 
     @objc private func refreshButtonPressed() {
@@ -928,24 +1108,50 @@ final class UsageViewController: NSViewController {
         let container = NSStackView()
         container.orientation = .vertical
         container.alignment = .leading
-        container.spacing = 2
+        container.spacing = 4
 
-        let headline = NSTextField(labelWithString: "\(snapshot.provider.rawValue): \(snapshot.primaryText)")
-        headline.font = .boldSystemFont(ofSize: 13)
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .firstBaseline
+        titleRow.spacing = 6
+
+        let headline = NSTextField(labelWithString: snapshot.provider.rawValue)
+        headline.font = .boldSystemFont(ofSize: 14)
         headline.textColor = snapshot.error == nil ? .labelColor : .systemOrange
-        container.addArrangedSubview(headline)
+        titleRow.addArrangedSubview(headline)
 
-        let updated = formatter.localizedString(for: snapshot.updatedAt, relativeTo: Date())
-        let detail = NSTextField(labelWithString: "\(snapshot.detailText) · updated \(updated)")
-        detail.font = .systemFont(ofSize: 12)
-        detail.textColor = .secondaryLabelColor
-        container.addArrangedSubview(detail)
+        if let plan = snapshot.planLabel {
+            let planLabel = NSTextField(labelWithString: plan)
+            planLabel.font = .systemFont(ofSize: 11)
+            planLabel.textColor = .tertiaryLabelColor
+            titleRow.addArrangedSubview(planLabel)
+        }
+        container.addArrangedSubview(titleRow)
 
         if let error = snapshot.error {
             let errorLabel = NSTextField(wrappingLabelWithString: error)
-            errorLabel.font = .systemFont(ofSize: 11)
-            errorLabel.textColor = .tertiaryLabelColor
+            errorLabel.font = .systemFont(ofSize: 12)
+            errorLabel.textColor = .systemOrange
             container.addArrangedSubview(errorLabel)
+        } else {
+            let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
+            let daily = NSTextField(labelWithString:
+                "5-hour window: \(UsageFormat.percentText(snapshot.dailyPercent))  ·  resets in \(reset)")
+            daily.font = .systemFont(ofSize: 12)
+            daily.textColor = .labelColor
+            container.addArrangedSubview(daily)
+
+            let weekly = NSTextField(labelWithString:
+                "Weekly: \(UsageFormat.percentText(snapshot.weeklyPercent))  ·  \(UsageFormat.tokenText(snapshot.totalTokens)) tokens")
+            weekly.font = .systemFont(ofSize: 12)
+            weekly.textColor = .secondaryLabelColor
+            container.addArrangedSubview(weekly)
+
+            let updated = formatter.localizedString(for: snapshot.updatedAt, relativeTo: Date())
+            let updatedLabel = NSTextField(labelWithString: "updated \(updated)")
+            updatedLabel.font = .systemFont(ofSize: 10)
+            updatedLabel.textColor = .tertiaryLabelColor
+            container.addArrangedSubview(updatedLabel)
         }
 
         return container
@@ -958,24 +1164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let collectors: [UsageCollecting] = [
-            LocalLogCollector(
-                provider: .claude,
-                candidatePaths: [
-                    "~/.claude",
-                    "~/Library/Application Support/Claude",
-                    "~/Library/Logs/Claude"
-                ],
-                keywords: ["claude", "total_tokens", "input_tokens", "output_tokens"]
-            ),
-            LocalLogCollector(
-                provider: .codex,
-                candidatePaths: [
-                    "~/.codex",
-                    "~/Library/Application Support/Codex",
-                    "~/Library/Logs/Codex"
-                ],
-                keywords: ["codex", "total_tokens", "input_tokens", "output_tokens"]
-            )
+            ClaudeUsageCollector(),
+            CodexUsageCollector()
         ]
 
         let controller = TouchBarController(store: UsageStore(collectors: collectors))

@@ -4,18 +4,29 @@ Native macOS menu bar utility that shows Claude Code and Codex usage details in 
 
 ## Current status
 
-This is an initial working scaffold:
-
 - AppKit menu bar process.
 - `NSTouchBar` with two provider buttons: Codex and Claude.
-- Selected-provider detail tile with hours used, daily usage percent, reset time, and weekly usage percent.
+- Selected-provider detail tile with color-graded progress bars for the rolling
+  5-hour and weekly limit windows, the consumed percentage, and the reset countdown.
 - Account connection panel that checks local Codex and Claude Code login state before showing usage.
 - Manual refresh and 60-second background refresh.
-- Local log/state-file collectors with conservative heuristics for token/event counters.
 - Popover summary from the menu bar item.
 - Small focus host panel that makes the app active so macOS will show its Touch Bar controls.
 
-The provider collectors currently look for local usage files in common locations and count token/event hints. The exact provider quota contracts should be tightened once the real local files or APIs you want to use are confirmed.
+### How usage is read
+
+The collectors parse the providers' real local telemetry — no estimates for Codex:
+
+- **Codex** reads the latest session rollout files in `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`
+  and uses the most recent `token_count` event. That event carries the account-wide
+  `rate_limits.primary` (5-hour window) and `rate_limits.secondary` (weekly window) with
+  `used_percent` and `resets_at`, plus cumulative token totals and the plan type.
+- **Claude Code** does not expose a rate-limit percentage, so usage is derived from the
+  actual per-message `usage` totals in `~/.claude/projects/**/*.jsonl`, aggregated over the
+  rolling 5-hour and 7-day windows. The percentage is an estimate against the token budgets
+  in `ClaudeUsageCollector` (`fiveHourTokenBudget` / `weeklyTokenBudget`) — adjust them to
+  match your plan.
+
 
 ## Build and run
 
@@ -49,14 +60,13 @@ If your macOS version does not expose third-party Control Strip pinning, the rel
 
 ## Provider data paths
 
-Initial search paths:
+Usage data sources:
 
-- Claude: `~/.claude`, `~/Library/Application Support/Claude`, `~/Library/Logs/Claude`
-- Codex: `~/.codex`, `~/Library/Application Support/Codex`, `~/Library/Logs/Codex`
+- Claude: `~/.claude/projects/**/*.jsonl` (per-message `usage` token totals)
+- Codex: `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl` (`token_count` rate-limit events)
 
 Login state detection:
 
 - Claude: `~/.claude.json`, `~/.claude/.credentials.json`, `~/.claude/config.json`, `~/.config/claude/credentials.json`
 - Codex: `~/.codex/auth.json`, `~/.codex/config.toml`
 
-Next implementation step: replace the heuristic collectors with provider-specific parsers once sample files are available.
