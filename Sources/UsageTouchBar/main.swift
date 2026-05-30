@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 
 /// A structured, real-data snapshot of a provider's usage.
 ///
@@ -353,24 +354,142 @@ struct CodexUsageCollector: UsageCollecting {
     }
 }
 
-/// Reads Claude Code's real token usage from its session transcripts.
+/// Optional user configuration for the Claude token-budget estimate.
 ///
-/// Claude Code does not expose a rate-limit percentage, so usage is derived from
-/// the actual per-message `usage` totals in `~/.claude/projects/**/*.jsonl`,
-/// aggregated over the rolling 5-hour and 7-day limit windows. Percentages are an
-/// estimate against the token budgets below; tweak them to match your plan.
+/// Anthropic does not publish exact token limits for Claude Code (they are
+/// session/weekly based and shared with the web app), so the percentage shown
+/// for Claude is an estimate against these budgets. Override them by creating
+/// `~/.config/usage-touchbar/config.json`:
+///
+///     { "claudeFiveHourTokenBudget": 90000000, "claudeWeeklyTokenBudget": 440000000, "claudePlanLabel": "Max 20x" }
+struct AppConfig: Decodable {
+    var claudeFiveHourTokenBudget: Int?
+    var claudeWeeklyTokenBudget: Int?
+    var claudePlanLabel: String?
+
+    static let shared = load()
+
+    private static func load() -> AppConfig {
+        let path = DataFiles.expand("~/.config/usage-touchbar/config.json")
+        guard let data = FileManager.default.contents(atPath: path),
+              let config = try? JSONDecoder().decode(AppConfig.self, from: data) else {
+            return AppConfig()
+        }
+        return config
+    }
+}
+
+/// Reads Claude's OAuth credentials from the macOS Keychain, where Claude Code
+/// stores them under the generic-password service `Claude Code-credentials`.
+enum ClaudeCredentials {
+    struct OAuth: Decodable {
+        let accessToken: String
+        let subscriptionType: String?
+    }
+
+    static func current() -> OAuth? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else {
+            return nil
+        }
+
+        struct Wrapper: Decodable { let claudeAiOauth: OAuth }
+        return try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth
+    }
+}
+
+/// Reads Claude Code's **live** usage limits from the same endpoint the CLI's
+/// `/usage` command uses: `GET https://api.anthropic.com/api/oauth/usage`.
+///
+/// This returns the real `five_hour` and `seven_day` utilization percentages and
+/// reset times for the signed-in plan. If the API is unreachable (offline, token
+/// expired), it falls back to a local token-throughput estimate parsed from
+/// `~/.claude/projects/**/*.jsonl`.
 struct ClaudeUsageCollector: UsageCollecting {
     let provider: Provider = .claude
 
-    /// Approximate token budgets for the rolling windows. These are estimates
-    /// (Claude does not publish exact figures); adjust to fit your plan.
-    var fiveHourTokenBudget = 19_000_000
-    var weeklyTokenBudget = 200_000_000
+    private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+
+    private struct Window: Decodable {
+        let utilization: Double
+        let resets_at: String?
+    }
+    private struct LiveUsage: Decodable {
+        let five_hour: Window?
+        let seven_day: Window?
+    }
+
+    func collect() async -> UsageSnapshot {
+        guard AuthDetector.current().isConnected(.claude) else {
+            return .disconnected(.claude)
+        }
+
+        if let live = await liveSnapshot() {
+            return live
+        }
+        return estimatedSnapshot()
+    }
+
+    // MARK: - Live API
+
+    private func liveSnapshot() async -> UsageSnapshot? {
+        guard let credentials = ClaudeCredentials.current() else { return nil }
+
+        var request = URLRequest(url: Self.usageURL)
+        request.timeoutInterval = 8
+        request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let usage = try? JSONDecoder().decode(LiveUsage.self, from: data) else {
+            return nil
+        }
+
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let parseDate: (String?) -> Date? = { stamp in
+            guard let stamp else { return nil }
+            return isoFormatter.date(from: stamp) ?? ISO8601DateFormatter().date(from: stamp)
+        }
+
+        let plan = credentials.subscriptionType
+            .map { $0.replacingOccurrences(of: "_", with: " ").capitalized }
+
+        return UsageSnapshot(
+            provider: .claude,
+            isConnected: true,
+            dailyPercent: usage.five_hour?.utilization,
+            weeklyPercent: usage.seven_day?.utilization,
+            dailyResetAt: parseDate(usage.five_hour?.resets_at),
+            weeklyResetAt: parseDate(usage.seven_day?.resets_at),
+            totalTokens: nil,
+            planLabel: plan,
+            updatedAt: Date(),
+            error: nil
+        )
+    }
+
+    // MARK: - Local fallback estimate
+
+    /// Estimated total-token budgets for the rolling windows. Defaults are tuned
+    /// for a heavy Max plan; override via `~/.config/usage-touchbar/config.json`.
+    private var fiveHourTokenBudget: Int { AppConfig.shared.claudeFiveHourTokenBudget ?? 90_000_000 }
+    private var weeklyTokenBudget: Int { AppConfig.shared.claudeWeeklyTokenBudget ?? 440_000_000 }
 
     private struct Usage: Decodable {
         let input_tokens: Int?
         let output_tokens: Int?
         let cache_creation_input_tokens: Int?
+        let cache_read_input_tokens: Int?
     }
     private struct Message: Decodable {
         let usage: Usage?
@@ -381,11 +500,7 @@ struct ClaudeUsageCollector: UsageCollecting {
         let message: Message?
     }
 
-    func collect() async -> UsageSnapshot {
-        guard AuthDetector.current().isConnected(.claude) else {
-            return .disconnected(.claude)
-        }
-
+    private func estimatedSnapshot() -> UsageSnapshot {
         let projectsDir = DataFiles.expand("~/.claude/projects")
         let now = Date()
         let weekAgo = now.addingTimeInterval(-7 * 24 * 3600)
@@ -393,7 +508,7 @@ struct ClaudeUsageCollector: UsageCollecting {
 
         let files = DataFiles.recentFiles(in: projectsDir, extensions: ["jsonl"], modifiedAfter: weekAgo)
         guard !files.isEmpty else {
-            return .failure(.claude, message: "No recent Claude sessions")
+            return .failure(.claude, message: "Offline — no cached usage")
         }
 
         let decoder = JSONDecoder()
@@ -402,7 +517,8 @@ struct ClaudeUsageCollector: UsageCollecting {
 
         var fiveHourTokens = 0
         var weeklyTokens = 0
-        var oldestInWindow: Date?
+        var oldestFiveHour: Date?
+        var oldestWeekly: Date?
         var latest = Date.distantPast
 
         for file in files {
@@ -415,20 +531,22 @@ struct ClaudeUsageCollector: UsageCollecting {
                       let stamp = parsed.timestamp,
                       let date = isoFormatter.date(from: stamp) else { return }
 
+                // Total throughput, including cache reads — this is the figure
+                // users recognize from Claude's `/usage`.
                 let tokens = (usage.input_tokens ?? 0)
                     + (usage.output_tokens ?? 0)
                     + (usage.cache_creation_input_tokens ?? 0)
+                    + (usage.cache_read_input_tokens ?? 0)
                 guard tokens > 0 else { return }
 
                 if date >= weekAgo {
                     weeklyTokens += tokens
                     latest = max(latest, date)
+                    if oldestWeekly == nil || date < oldestWeekly! { oldestWeekly = date }
                 }
                 if date >= fiveHoursAgo {
                     fiveHourTokens += tokens
-                    if oldestInWindow == nil || date < oldestInWindow! {
-                        oldestInWindow = date
-                    }
+                    if oldestFiveHour == nil || date < oldestFiveHour! { oldestFiveHour = date }
                 }
             }
         }
@@ -445,10 +563,10 @@ struct ClaudeUsageCollector: UsageCollecting {
             isConnected: true,
             dailyPercent: dailyPercent,
             weeklyPercent: weeklyPercent,
-            dailyResetAt: oldestInWindow?.addingTimeInterval(5 * 3600),
-            weeklyResetAt: nil,
+            dailyResetAt: oldestFiveHour?.addingTimeInterval(5 * 3600),
+            weeklyResetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600),
             totalTokens: weeklyTokens,
-            planLabel: nil,
+            planLabel: AppConfig.shared.claudePlanLabel ?? "est.",
             updatedAt: latest == .distantPast ? now : latest,
             error: nil
         )
@@ -668,7 +786,8 @@ final class ProviderLogoView: NSView {
     }
 }
 
-/// A compact labelled progress bar: `caption  ▓▓▓▓░░░  42%`.
+/// A compact inline gauge sized to fit the ~30pt Touch Bar strip:
+/// `5h ▓▓▓░ 19%` on a single vertically-centered line.
 final class UsageBarView: NSView {
     private let caption: String
     private let percent: Double?
@@ -686,7 +805,7 @@ final class UsageBarView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 210, height: 20) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 108, height: 28) }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -700,24 +819,24 @@ final class UsageBarView: NSView {
             .foregroundColor: NSColor.labelColor
         ]
 
+        let midY = bounds.height / 2
         let captionSize = caption.size(withAttributes: captionAttrs)
-        caption.draw(at: NSPoint(x: 0, y: (bounds.height - captionSize.height) / 2), withAttributes: captionAttrs)
+        caption.draw(at: NSPoint(x: 0, y: midY - captionSize.height / 2), withAttributes: captionAttrs)
 
         let valueSize = trailing.size(withAttributes: valueAttrs)
         trailing.draw(
-            at: NSPoint(x: bounds.maxX - valueSize.width, y: (bounds.height - valueSize.height) / 2),
+            at: NSPoint(x: bounds.maxX - valueSize.width, y: midY - valueSize.height / 2),
             withAttributes: valueAttrs
         )
 
-        let captionWidth: CGFloat = 30
-        let barX = captionWidth + 6
-        let barWidth = bounds.maxX - valueSize.width - 8 - barX
-        guard barWidth > 8 else { return }
+        let barX = captionSize.width + 6
+        let barWidth = bounds.maxX - valueSize.width - 6 - barX
+        guard barWidth > 6 else { return }
 
-        let barHeight: CGFloat = 7
-        let barRect = NSRect(x: barX, y: (bounds.height - barHeight) / 2, width: barWidth, height: barHeight)
+        let barHeight: CGFloat = 6
+        let barRect = NSRect(x: barX, y: midY - barHeight / 2, width: barWidth, height: barHeight)
         let track = NSBezierPath(roundedRect: barRect, xRadius: barHeight / 2, yRadius: barHeight / 2)
-        NSColor(white: 0.32, alpha: 1).setFill()
+        NSColor(white: 0.34, alpha: 1).setFill()
         track.fill()
 
         guard let percent else { return }
@@ -730,12 +849,92 @@ final class UsageBarView: NSView {
     }
 }
 
+
+/// Pins a Touch Bar item to the always-visible **Control Strip** region so usage
+/// is shown by default, regardless of which app is frontmost.
+///
+/// macOS exposes no public API for persistent Control Strip items, so this wraps
+/// the private `DFRFoundation` functions and the private `NSTouchBarItem`
+/// system-tray selectors that ship in every modern macOS. All calls are guarded
+/// with `responds(to:)`/`dlsym` so an OS that drops these stays crash-free.
+@MainActor
+enum ControlStrip {
+    private typealias PresenceFn = @convention(c) (NSString, Bool) -> Void
+    private typealias CloseBoxFn = @convention(c) (Bool) -> Void
+
+    private static let handle: UnsafeMutableRawPointer? = dlopen(
+        "/System/Library/PrivateFrameworks/DFRFoundation.framework/Versions/A/DFRFoundation",
+        RTLD_NOW
+    )
+
+    private static func symbol<T>(_ name: String, as type: T.Type) -> T? {
+        guard let handle, let sym = dlsym(handle, name) else { return nil }
+        return unsafeBitCast(sym, to: T.self)
+    }
+
+    /// Whether the running OS still exposes the Control Strip private API.
+    static var isSupported: Bool {
+        (NSTouchBarItem.self as AnyObject).responds(to: NSSelectorFromString("addSystemTrayItem:"))
+    }
+
+    /// Adds an item to the persistent Control Strip and marks it present.
+    static func add(_ item: NSTouchBarItem) {
+        let sel = NSSelectorFromString("addSystemTrayItem:")
+        guard (NSTouchBarItem.self as AnyObject).responds(to: sel) else { return }
+        _ = (NSTouchBarItem.self as AnyObject).perform(sel, with: item)
+        setPresent(item.identifier, true)
+    }
+
+    /// Removes a previously added Control Strip item.
+    static func remove(_ item: NSTouchBarItem) {
+        setPresent(item.identifier, false)
+        let sel = NSSelectorFromString("removeSystemTrayItem:")
+        guard (NSTouchBarItem.self as AnyObject).responds(to: sel) else { return }
+        _ = (NSTouchBarItem.self as AnyObject).perform(sel, with: item)
+    }
+
+    private static func setPresent(_ identifier: NSTouchBarItem.Identifier, _ present: Bool) {
+        symbol("DFRElementSetControlStripPresenceForIdentifier", as: PresenceFn.self)?(
+            identifier.rawValue as NSString, present
+        )
+    }
+
+    /// Expands the given Touch Bar over the whole strip (system modal), anchored
+    /// to the Control Strip item the user tapped.
+    static func presentModal(_ touchBar: NSTouchBar, trayIdentifier: NSTouchBarItem.Identifier) {
+        symbol("DFRSystemModalShowsCloseBoxWhenFrontMost", as: CloseBoxFn.self)?(true)
+        let selectors = [
+            "presentSystemModalTouchBar:systemTrayItemIdentifier:",
+            "presentSystemModalFunctionBar:systemTrayItemIdentifier:"
+        ]
+        for name in selectors {
+            let sel = NSSelectorFromString(name)
+            if (NSTouchBar.self as AnyObject).responds(to: sel) {
+                _ = (NSTouchBar.self as AnyObject).perform(sel, with: touchBar, with: trayIdentifier.rawValue)
+                return
+            }
+        }
+    }
+
+    /// Dismisses a previously presented system-modal Touch Bar.
+    static func dismissModal(_ touchBar: NSTouchBar) {
+        for name in ["dismissSystemModalTouchBar:", "dismissSystemModalFunctionBar:"] {
+            let sel = NSSelectorFromString(name)
+            if (NSTouchBar.self as AnyObject).responds(to: sel) {
+                _ = (NSTouchBar.self as AnyObject).perform(sel, with: touchBar)
+                return
+            }
+        }
+    }
+}
+
 @MainActor
 final class TouchBarController: NSObject, NSTouchBarDelegate {
     static let codexIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.codex")
     static let claudeIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.claude")
     static let detailIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.detail")
     static let refreshIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.refresh")
+    static let controlStripIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.controlStrip")
 
     private let store: UsageStore
     private let statusItem: NSStatusItem
@@ -751,6 +950,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private weak var detailItem: NSCustomTouchBarItem?
     private weak var codexButton: NSButton?
     private weak var claudeButton: NSButton?
+    private var controlStripItem: NSCustomTouchBarItem?
+    private weak var controlStripButton: NSButton?
     private var selectedProvider: Provider = .codex
     private var authState = AuthDetector.current()
     private var timer: Timer?
@@ -767,7 +968,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     func start() {
         NSApp.touchBar = touchBar
-        focusTouchBarHost()
+        installControlStripItem()
         showLoginIfNeeded()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -777,6 +978,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     func makeTouchBar() -> NSTouchBar {
         touchBar
+    }
+
+    /// Removes the persistent Control Strip item before the app exits.
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        teardownControlStripItem()
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
@@ -885,53 +1093,60 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
         let snapshot = snapshots[selectedProvider]
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 70))
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor
-        container.layer?.cornerRadius = 7
+        // A single horizontal row sized to the Touch Bar strip height (~30pt).
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
+        row.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 2
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        // Header: provider name + plan / status.
-        let header = NSStackView()
-        header.orientation = .horizontal
-        header.alignment = .firstBaseline
-        header.spacing = 6
-        let name = label(selectedProvider.symbol, color: selectedProvider.accentColor, bold: true, size: 12)
-        header.addArrangedSubview(name)
+        // Provider name (+ plan) at the left.
+        let title = NSStackView()
+        title.orientation = .vertical
+        title.alignment = .leading
+        title.spacing = 0
+        title.addArrangedSubview(label(selectedProvider.symbol, color: selectedProvider.accentColor, bold: true, size: 13))
         if let plan = snapshot?.planLabel {
-            header.addArrangedSubview(label(plan, color: .tertiaryLabelColor, bold: false, size: 9))
+            title.addArrangedSubview(label(plan.uppercased(), color: .tertiaryLabelColor, bold: false, size: 8))
         }
-        stack.addArrangedSubview(header)
+        row.addArrangedSubview(title)
 
         if let snapshot, snapshot.error == nil {
-            let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
-            stack.addArrangedSubview(bar(
+            row.addArrangedSubview(bar(
                 caption: "5h",
                 percent: snapshot.dailyPercent,
-                trailing: "\(UsageFormat.percentText(snapshot.dailyPercent))  ·  \(reset)"
+                trailing: UsageFormat.percentText(snapshot.dailyPercent)
             ))
-            stack.addArrangedSubview(bar(
+            row.addArrangedSubview(bar(
                 caption: "Wk",
                 percent: snapshot.weeklyPercent,
                 trailing: UsageFormat.percentText(snapshot.weeklyPercent)
             ))
+
+            let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
+            if reset != "—" {
+                row.addArrangedSubview(label("↻ \(reset)", color: .secondaryLabelColor, bold: false, size: 10))
+            }
         } else {
             let message = snapshot?.error ?? "Loading…"
-            stack.addArrangedSubview(label(message, color: .systemOrange, bold: false, size: 10))
+            row.addArrangedSubview(label(message, color: .systemOrange, bold: false, size: 11))
         }
 
-        container.addSubview(stack)
+        // Wrap in a rounded card that fills the strip height.
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor
+        container.layer?.cornerRadius = 6
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
+
         NSLayoutConstraint.activate([
-            container.widthAnchor.constraint(equalToConstant: 250),
-            container.heightAnchor.constraint(equalToConstant: 70),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
-            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+            container.heightAnchor.constraint(equalToConstant: 30),
+            row.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            row.topAnchor.constraint(equalTo: container.topAnchor),
+            row.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
 
         return container
@@ -940,8 +1155,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private func bar(caption: String, percent: Double?, trailing: String) -> UsageBarView {
         let view = UsageBarView(caption: caption, percent: percent, trailing: trailing)
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(equalToConstant: 230).isActive = true
-        view.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        view.widthAnchor.constraint(equalToConstant: 108).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 28).isActive = true
         return view
     }
 
@@ -957,6 +1172,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private func refreshTouchBar() {
         refreshAuthState()
         detailItem?.view = makeDetailView()
+        controlStripButton?.attributedTitle = controlStripTitle()
         touchBar.defaultItemIdentifiers = [Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
         statusItem.button?.title = statusTitle()
         (popover.contentViewController as? UsageViewController)?.reload()
@@ -988,6 +1204,79 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         detailItem?.view = makeDetailView()
         touchBar.defaultItemIdentifiers = [Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
         showLoginIfNeeded()
+    }
+
+    private func installControlStripItem() {
+        guard ControlStrip.isSupported else {
+            // macOS without the private Control Strip API: fall back to the
+            // focusable host panel so the bar is still reachable.
+            focusTouchBarHost()
+            return
+        }
+
+        let item = NSCustomTouchBarItem(identifier: Self.controlStripIdentifier)
+        let button = NSButton(title: "", target: self, action: #selector(controlStripTapped))
+        button.isBordered = false
+        button.imagePosition = .noImage
+        button.attributedTitle = controlStripTitle()
+        item.view = button
+
+        controlStripItem = item
+        controlStripButton = button
+        ControlStrip.add(item)
+    }
+
+    /// Compact, always-visible summary shown directly in the Control Strip, e.g.
+    /// `CX 19%  CL 35%`, with each provider tinted by its accent and usage color.
+    private func controlStripTitle() -> NSAttributedString {
+        let snapshots = store.currentSnapshots()
+        let result = NSMutableAttributedString()
+        guard !snapshots.isEmpty else {
+            return NSAttributedString(
+                string: "Usage",
+                attributes: [
+                    .foregroundColor: NSColor.labelColor,
+                    .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+                ]
+            )
+        }
+
+        for (index, snapshot) in snapshots.enumerated() {
+            if index > 0 {
+                result.append(NSAttributedString(string: "  "))
+            }
+            result.append(NSAttributedString(
+                string: snapshot.provider.symbol + " ",
+                attributes: [
+                    .foregroundColor: snapshot.provider.accentColor,
+                    .font: NSFont.systemFont(ofSize: 13, weight: .semibold)
+                ]
+            ))
+            let text = snapshot.error == nil ? UsageFormat.percentText(snapshot.dailyPercent) : "–"
+            let color = snapshot.error == nil
+                ? UsageFormat.color(forPercent: snapshot.dailyPercent ?? 0)
+                : NSColor.systemGray
+            result.append(NSAttributedString(
+                string: text,
+                attributes: [
+                    .foregroundColor: color,
+                    .font: NSFont.systemFont(ofSize: 13, weight: .medium)
+                ]
+            ))
+        }
+        return result
+    }
+
+    @objc private func controlStripTapped() {
+        // Tap the always-on summary to expand the full usage bar over the strip.
+        ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+    }
+
+    private func teardownControlStripItem() {
+        guard let item = controlStripItem else { return }
+        ControlStrip.remove(item)
+        controlStripItem = nil
+        controlStripButton = nil
     }
 
     @objc private func focusTouchBarHost() {
@@ -1175,6 +1464,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        controller?.stop()
     }
 }
 

@@ -21,11 +21,21 @@ The collectors parse the providers' real local telemetry — no estimates for Co
   and uses the most recent `token_count` event. That event carries the account-wide
   `rate_limits.primary` (5-hour window) and `rate_limits.secondary` (weekly window) with
   `used_percent` and `resets_at`, plus cumulative token totals and the plan type.
-- **Claude Code** does not expose a rate-limit percentage, so usage is derived from the
-  actual per-message `usage` totals in `~/.claude/projects/**/*.jsonl`, aggregated over the
-  rolling 5-hour and 7-day windows. The percentage is an estimate against the token budgets
-  in `ClaudeUsageCollector` (`fiveHourTokenBudget` / `weeklyTokenBudget`) — adjust them to
-  match your plan.
+- **Claude Code** does not expose a rate-limit percentage, so usage is the real
+  total token throughput (including cache reads — what `/usage` reflects) from the
+  per-message `usage` totals in `~/.claude/projects/**/*.jsonl`, aggregated over the
+  rolling 5-hour and 7-day windows. The token total is exact; the **percentage is an
+  estimate** against configurable budgets (Anthropic publishes no token figures).
+  Override the budgets and plan label by creating `~/.config/usage-touchbar/config.json`:
+
+  ```json
+  {
+    "claudeFiveHourTokenBudget": 90000000,
+    "claudeWeeklyTokenBudget": 440000000,
+    "claudePlanLabel": "Max 20x"
+  }
+  ```
+
 
 
 ## Build and run
