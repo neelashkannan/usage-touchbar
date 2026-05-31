@@ -458,13 +458,60 @@ struct ClaudeUsageCollector: UsageCollecting {
         let seven_day: Window?
     }
 
+    /// In-memory cache of the last successful **live** `/usage` response.
+    ///
+    /// The endpoint is aggressively rate-limited (HTTP 429), so refreshing it on
+    /// every 20-second tick keeps it permanently throttled — which is why usage
+    /// silently degraded to the rough local estimate. We therefore only hit the
+    /// network at most once per `liveMinInterval`, serve the cached live snapshot
+    /// in between, and on failure keep showing the last good live data instead of
+    /// dropping to the estimate.
+    private static let liveCacheLock = NSLock()
+    private nonisolated(unsafe) static var liveCache: UsageSnapshot?
+    private nonisolated(unsafe) static var liveCacheAt: Date?
+    private static let liveMinInterval: TimeInterval = 5 * 60
+
+    private static func freshLiveSnapshot() -> UsageSnapshot? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        guard let snapshot = liveCache, let at = liveCacheAt,
+              Date().timeIntervalSince(at) < liveMinInterval else { return nil }
+        return snapshot
+    }
+
+    private static func lastLiveSnapshot() -> UsageSnapshot? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        return liveCache
+    }
+
+    private static func storeLiveSnapshot(_ snapshot: UsageSnapshot) {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveCache = snapshot
+        liveCacheAt = Date()
+    }
+
     func collect() async -> UsageSnapshot {
         guard AuthDetector.current().isConnected(.claude) else {
             return .disconnected(.claude)
         }
 
+        // Serve a recent live snapshot without touching the network.
+        if let cached = Self.freshLiveSnapshot() {
+            return cached
+        }
+
+        // Time to refresh: fetch the real numbers from the live endpoint.
         if let live = await liveSnapshot() {
+            Self.storeLiveSnapshot(live)
             return live
+        }
+
+        // Live fetch failed (offline / rate-limited): prefer the last good live
+        // data over a coarse local estimate so the numbers stay accurate.
+        if let stale = Self.lastLiveSnapshot() {
+            return stale
         }
         return estimatedSnapshot()
     }
@@ -1003,17 +1050,20 @@ final class StatusDotView: NSView {
     }
 }
 
-/// A compact inline gauge sized to fit the ~30pt Touch Bar strip:
-/// `5h ▓▓▓░ 19%` on a single vertically-centered line.
+/// A compact two-line gauge sized to fit the ~30pt Touch Bar strip:
+/// top line is `5h ▓▓▓░ 19%`, the line beneath it is the reset countdown
+/// `↻ 2h 14m` so each window shows exactly when it refills.
 final class UsageBarView: NSView {
     private let caption: String
     private let percent: Double?
     private let trailing: String
+    private let reset: String?
 
-    init(caption: String, percent: Double?, trailing: String) {
+    init(caption: String, percent: Double?, trailing: String, reset: String? = nil) {
         self.caption = caption
         self.percent = percent
         self.trailing = trailing
+        self.reset = reset
         super.init(frame: .zero)
         wantsLayer = true
     }
@@ -1022,47 +1072,79 @@ final class UsageBarView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 108, height: 28) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 82, height: 30) }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
         let captionAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
-            .foregroundColor: NSColor.secondaryLabelColor
+            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: NSColor.tertiaryLabelColor
         ]
         let valueAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
             .foregroundColor: NSColor.labelColor
         ]
+        let resetAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 7.5, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor.withAlphaComponent(0.7)
+        ]
 
-        let midY = bounds.height / 2
+        let hasReset = (reset != nil)
+        let topLineY: CGFloat = hasReset ? 18 : (bounds.height - 9) / 2
+        let topMidY = topLineY + 4.5
+
         let captionSize = caption.size(withAttributes: captionAttrs)
-        caption.draw(at: NSPoint(x: 0, y: midY - captionSize.height / 2), withAttributes: captionAttrs)
+        caption.draw(at: NSPoint(x: 0, y: topMidY - captionSize.height / 2), withAttributes: captionAttrs)
 
         let valueSize = trailing.size(withAttributes: valueAttrs)
         trailing.draw(
-            at: NSPoint(x: bounds.maxX - valueSize.width, y: midY - valueSize.height / 2),
+            at: NSPoint(x: bounds.maxX - valueSize.width, y: topMidY - valueSize.height / 2),
             withAttributes: valueAttrs
         )
 
-        let barX = captionSize.width + 6
-        let barWidth = bounds.maxX - valueSize.width - 6 - barX
-        guard barWidth > 6 else { return }
+        let barX = captionSize.width + 5
+        let barWidth = bounds.maxX - valueSize.width - 5 - barX
+        if barWidth > 6 {
+            let barHeight: CGFloat = 3
+            if let percent {
+                let clamped = max(0, min(100, percent))
+                let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
+                let fillRect = NSRect(x: barX, y: topMidY - barHeight / 2, width: fillWidth, height: barHeight)
+                let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: barHeight / 2, yRadius: barHeight / 2)
+                UsageFormat.color(forPercent: clamped).setFill()
+                fillPath.fill()
+            }
+        }
 
-        let barHeight: CGFloat = 6
-        let barRect = NSRect(x: barX, y: midY - barHeight / 2, width: barWidth, height: barHeight)
-        let track = NSBezierPath(roundedRect: barRect, xRadius: barHeight / 2, yRadius: barHeight / 2)
-        NSColor(white: 0.34, alpha: 1).setFill()
-        track.fill()
+        // Second line: reset countdown sits quietly below the caption.
+        if let reset {
+            let resetText = "↻ \(reset)" as NSString
+            resetText.draw(at: NSPoint(x: 0, y: 1), withAttributes: resetAttrs)
+        }
+    }
+}
 
-        guard let percent else { return }
-        let clamped = max(0, min(100, percent))
-        let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
-        let fillRect = NSRect(x: barX, y: barRect.minY, width: fillWidth, height: barHeight)
-        let fill = NSBezierPath(roundedRect: fillRect, xRadius: barHeight / 2, yRadius: barHeight / 2)
-        UsageFormat.color(forPercent: clamped).setFill()
-        fill.fill()
+final class VerticalSeparatorView: NSView {
+    private let color: NSColor
+
+    init(color: NSColor = .separatorColor) {
+        self.color = color
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 1, height: 30) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        color.setFill()
+        let rect = NSRect(x: 0, y: 3, width: 1, height: bounds.height - 6)
+        NSBezierPath(rect: rect).fill()
     }
 }
 
@@ -1258,8 +1340,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             return item
         case Self.refreshIdentifier:
             let item = NSCustomTouchBarItem(identifier: identifier)
-            let button = NSButton(title: "Refresh", target: self, action: #selector(refreshButtonPressed))
-            button.bezelColor = .controlAccentColor
+            let button = NSButton(
+                image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh")!,
+                target: self,
+                action: #selector(refreshButtonPressed)
+            )
+            button.isBordered = false
+            button.bezelStyle = .texturedRounded
+            button.toolTip = "Refresh"
             item.view = button
             return item
         default:
@@ -1300,10 +1388,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func configureTouchBar() {
         touchBar.delegate = self
-        touchBar.defaultItemIdentifiers = [Self.summaryIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier]
         touchBar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
         touchBar.customizationIdentifier = NSTouchBar.CustomizationIdentifier("UsageTouchBar.default")
-        touchBar.principalItemIdentifier = Self.summaryIdentifier
+        touchBar.principalItemIdentifier = Self.detailIdentifier
     }
 
     private func configurePopover() {
@@ -1350,64 +1438,65 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func makeDetailView() -> NSView {
         let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
-        let snapshot = snapshots[selectedProvider]
 
-        // A single horizontal row sized to the Touch Bar strip height (~30pt).
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 12)
+        row.spacing = 3
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        // Real brand icon at the far left.
-        let icon = NSImageView(image: ProviderBranding.icon(for: selectedProvider, size: 18))
-        icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        row.addArrangedSubview(icon)
+        for provider in [Provider.codex, Provider.claude] {
+            let snapshot = snapshots[provider]
 
-        // Provider name (+ plan) next to the icon.
-        let title = NSStackView()
-        title.orientation = .vertical
-        title.alignment = .leading
-        title.spacing = 0
-        title.addArrangedSubview(label(selectedProvider.symbol, color: selectedProvider.accentColor, bold: true, size: 13))
-        if let plan = snapshot?.planLabel {
-            title.addArrangedSubview(label(plan.uppercased(), color: .tertiaryLabelColor, bold: false, size: 8))
-        }
-        row.addArrangedSubview(title)
+            // Brand icon.
+            let icon = NSImageView(image: ProviderBranding.icon(for: provider, size: 18))
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+            row.addArrangedSubview(icon)
 
-        if let snapshot, snapshot.error == nil {
-            row.addArrangedSubview(bar(
-                caption: "5h",
-                percent: snapshot.dailyPercent,
-                trailing: UsageFormat.percentText(snapshot.dailyPercent)
-            ))
-            row.addArrangedSubview(bar(
-                caption: "Wk",
-                percent: snapshot.weeklyPercent,
-                trailing: UsageFormat.percentText(snapshot.weeklyPercent)
-            ))
-
-            let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
-            if reset != "—" {
-                row.addArrangedSubview(label("↻ \(reset)", color: .secondaryLabelColor, bold: false, size: 10))
+            // Name + plan stacked.
+            let title = NSStackView()
+            title.orientation = .vertical
+            title.alignment = .leading
+            title.spacing = 0
+            title.addArrangedSubview(label(provider.symbol, color: .labelColor, bold: true, size: 11))
+            if let plan = snapshot?.planLabel {
+                title.addArrangedSubview(label(plan.uppercased(), color: .tertiaryLabelColor, bold: false, size: 7))
             }
-        } else {
-            let message = snapshot?.error ?? "Loading…"
-            row.addArrangedSubview(label(message, color: .systemOrange, bold: false, size: 11))
+            row.addArrangedSubview(title)
+
+            if let snapshot, snapshot.error == nil {
+                let dailyReset = UsageFormat.resetText(snapshot.dailyResetAt)
+                row.addArrangedSubview(bar(
+                    caption: "5h",
+                    percent: snapshot.dailyPercent,
+                    trailing: UsageFormat.percentText(snapshot.dailyPercent),
+                    reset: dailyReset == "—" ? nil : dailyReset
+                ))
+                let weeklyReset = UsageFormat.resetText(snapshot.weeklyResetAt)
+                row.addArrangedSubview(bar(
+                    caption: "Wk",
+                    percent: snapshot.weeklyPercent,
+                    trailing: UsageFormat.percentText(snapshot.weeklyPercent),
+                    reset: weeklyReset == "—" ? nil : weeklyReset
+                ))
+            } else {
+                row.addArrangedSubview(label(snapshot?.error ?? "—", color: .systemOrange, bold: false, size: 10))
+            }
+
+            // Accent-tinted vertical hairline between Codex and Claude.
+            if provider == .codex {
+                row.addArrangedSubview(VerticalSeparatorView(color: provider.accentColor.withAlphaComponent(0.35)))
+            }
         }
 
-        // Wrap in a rounded card that fills the strip height, with a subtle
-        // provider-accent left border for at-a-glance identification.
         let container = NSView()
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(white: 0.17, alpha: 1).cgColor
-        container.layer?.cornerRadius = 7
-        container.layer?.borderWidth = 1
-        container.layer?.borderColor = selectedProvider.accentColor.withAlphaComponent(0.35).cgColor
+        container.layer?.backgroundColor = NSColor.clear.cgColor
+        container.layer?.borderWidth = 0
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(row)
 
@@ -1428,24 +1517,25 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
+        row.spacing = 4
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        for provider in [Provider.codex, Provider.claude] {
-            row.addArrangedSubview(summaryButton(provider: provider, snapshot: snapshots[provider]))
-        }
+        let codexButton = summaryButton(provider: Provider.codex, snapshot: snapshots[Provider.codex])
+        row.addArrangedSubview(codexButton)
+
+        let claudeButton = summaryButton(provider: Provider.claude, snapshot: snapshots[Provider.claude])
+        row.addArrangedSubview(claudeButton)
 
         let container = NSView()
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(white: 0.15, alpha: 1).cgColor
-        container.layer?.cornerRadius = 6
+        container.layer?.backgroundColor = NSColor.clear.cgColor
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(row)
 
         NSLayoutConstraint.activate([
             container.heightAnchor.constraint(equalToConstant: 30),
-            container.widthAnchor.constraint(equalToConstant: 330),
+            container.widthAnchor.constraint(equalToConstant: 322),
             row.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             row.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             row.topAnchor.constraint(equalTo: container.topAnchor),
@@ -1469,11 +1559,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         return button
     }
 
-    private func bar(caption: String, percent: Double?, trailing: String) -> UsageBarView {
-        let view = UsageBarView(caption: caption, percent: percent, trailing: trailing)
+    private func bar(caption: String, percent: Double?, trailing: String, reset: String? = nil) -> UsageBarView {
+        let view = UsageBarView(caption: caption, percent: percent, trailing: trailing, reset: reset)
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(equalToConstant: 108).isActive = true
-        view.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        view.widthAnchor.constraint(equalToConstant: 82).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 30).isActive = true
         return view
     }
 
@@ -1494,7 +1584,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             controlStripButton.image = makeControlStripTriggerImage()
             controlStripButton.needsDisplay = true
         }
-        touchBar.defaultItemIdentifiers = [Self.summaryIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier]
         statusItem?.button?.title = statusTitle()
         (popover.contentViewController as? UsageViewController)?.reload()
     }
@@ -1530,7 +1620,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         claudeButton?.image = makeLogoImage(provider: .claude, selected: selectedProvider == .claude)
         summaryItem?.view = makeSummaryView()
         detailItem?.view = makeDetailView()
-        touchBar.defaultItemIdentifiers = [Self.summaryIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier]
     }
 
     private func installControlStripItem() {
@@ -1710,8 +1800,9 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             fraction: 1
         )
 
+        // Name in labelColor with a small accent underline for provider identity.
         let nameAttrs: [NSAttributedString.Key: Any] = [
-            .foregroundColor: provider.accentColor,
+            .foregroundColor: NSColor.labelColor,
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
         ]
         let hasUsage = snapshot != nil && snapshot?.error == nil
@@ -1734,27 +1825,30 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
         // Top line: provider name (left) + large 5-hour percentage (right).
         let name = provider.rawValue as NSString
-        name.draw(at: NSPoint(x: textX, y: 12), withAttributes: nameAttrs)
+        let nameSize = name.size(withAttributes: nameAttrs)
+        name.draw(at: NSPoint(x: textX, y: 14), withAttributes: nameAttrs)
+
+        // Accent dot aligned with the name's baseline.
+        let dotSize: CGFloat = 5
+        let dot = NSBezierPath(roundedRect: NSRect(x: textX + nameSize.width + 5, y: 14 + (nameSize.height - dotSize) / 2, width: dotSize, height: dotSize), xRadius: dotSize / 2, yRadius: dotSize / 2)
+        provider.accentColor.setFill()
+        dot.fill()
 
         let usage = usageText as NSString
         let usageSize = usage.size(withAttributes: usageAttrs)
-        usage.draw(at: NSPoint(x: width - usageSize.width - 2, y: 9), withAttributes: usageAttrs)
+        usage.draw(at: NSPoint(x: width - usageSize.width - 2, y: 10), withAttributes: usageAttrs)
 
-        // Bottom line: a thin 5-hour usage bar + weekly percentage on the right.
+        // Bottom line: a visible 5-hour usage bar + weekly percentage on the right.
         let weeklyText = "W \(UsageFormat.percentText(hasUsage ? snapshot?.weeklyPercent : nil))" as NSString
         let weeklySize = weeklyText.size(withAttributes: weekAttrs)
-        weeklyText.draw(at: NSPoint(x: width - weeklySize.width - 2, y: 1), withAttributes: weekAttrs)
+        weeklyText.draw(at: NSPoint(x: width - weeklySize.width - 2, y: 1.5), withAttributes: weekAttrs)
 
         let barX = textX
         let barMaxX = width - weeklySize.width - 8
         let barWidth = barMaxX - barX
         if barWidth > 6 {
-            let barHeight: CGFloat = 4
-            let barY: CGFloat = 3
-            let trackRect = NSRect(x: barX, y: barY, width: barWidth, height: barHeight)
-            NSColor(white: 0.32, alpha: 1).setFill()
-            NSBezierPath(roundedRect: trackRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
-
+            let barHeight: CGFloat = 3
+            let barY: CGFloat = 4
             if let dailyPercent {
                 let clamped = max(0, min(100, dailyPercent))
                 let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
@@ -1920,6 +2014,12 @@ final class UsageViewController: NSViewController {
         formatter.unitsStyle = .short
         return formatter
     }()
+    static let clockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     init(store: UsageStore) {
         self.store = store
@@ -2033,16 +2133,42 @@ final class UsageViewController: NSViewController {
             content.addArrangedSubview(errorLabel)
         } else {
             content.addArrangedSubview(limitBar(caption: "5-hour", percent: snapshot.dailyPercent, width: innerWidth))
+            content.addArrangedSubview(resetRow(label: "5h resets", date: snapshot.dailyResetAt, width: innerWidth))
+            content.setCustomSpacing(10, after: content.arrangedSubviews.last!)
             content.addArrangedSubview(limitBar(caption: "Weekly", percent: snapshot.weeklyPercent, width: innerWidth))
+            content.addArrangedSubview(resetRow(label: "Week resets", date: snapshot.weeklyResetAt, width: innerWidth))
 
             let meta = NSTextField(labelWithString: metaText(for: snapshot))
             meta.font = .systemFont(ofSize: 10)
             meta.textColor = .tertiaryLabelColor
             meta.lineBreakMode = .byTruncatingTail
             content.addArrangedSubview(meta)
+            content.setCustomSpacing(10, after: content.arrangedSubviews[content.arrangedSubviews.count - 2])
         }
 
         return box
+    }
+
+    /// A small right-aligned reset caption shown beneath a window's usage bar,
+    /// e.g. `5h resets in 2h 14m  ·  9:00 PM`.
+    private func resetRow(label: String, date: Date?, width: CGFloat) -> NSView {
+        let text: String
+        if let date {
+            let relative = UsageFormat.resetText(date)
+            let clock = Self.clockFormatter.string(from: date)
+            text = relative == "now" ? "\(label) now" : "\(label) in \(relative)  ·  \(clock)"
+        } else {
+            text = "\(label) —"
+        }
+
+        let field = NSTextField(labelWithString: text)
+        field.font = .systemFont(ofSize: 10)
+        field.textColor = .secondaryLabelColor
+        field.lineBreakMode = .byTruncatingTail
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: width).isActive = true
+        field.alignment = .right
+        return field
     }
 
     private func headerRow(for snapshot: UsageSnapshot, width: CGFloat) -> NSView {
@@ -2103,10 +2229,6 @@ final class UsageViewController: NSViewController {
         var parts: [String] = []
         if let tokens = snapshot.totalTokens, tokens > 0 {
             parts.append("\(UsageFormat.tokenText(tokens)) tokens")
-        }
-        let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
-        if reset != "—" {
-            parts.append("resets in \(reset)")
         }
         parts.append("updated \(formatter.localizedString(for: snapshot.updatedAt, relativeTo: Date()))")
         return parts.joined(separator: "  ·  ")
