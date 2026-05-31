@@ -58,8 +58,7 @@ swift build -c release
 
 BINARY="$ROOT/.build/release/usage-touchbar"
 
-# 3. Sign it with the stable identity + a fixed bundle identifier.
-echo "› Signing…"
+# 3. Resolve the stable signing identity.
 IDENTITY_SHA1="$(
     security find-certificate -a -c "$IDENTITY_NAME" -Z "$KEYCHAIN" \
         | awk '/SHA-1 hash:/ && !seen { print $3; seen=1 }'
@@ -70,32 +69,77 @@ if [[ -z "$IDENTITY_SHA1" ]]; then
     exit 1
 fi
 
+# 4. Assemble ONE app bundle. A single bundle (one identity, one bundle id)
+#    means exactly one Keychain "Always Allow" grant — no more repeat prompts.
+APP="$ROOT/UsageTouchBar.app"
+echo "› Building app bundle…"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp -f "$BINARY" "$APP/Contents/MacOS/usage-touchbar"
+cp -f "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+
+# 5. Sign the bundle with the stable identity + fixed bundle identifier.
+echo "› Signing…"
 codesign --force --options runtime \
     --identifier "$BUNDLE_ID" \
     --sign "$IDENTITY_SHA1" \
-    "$BINARY"
+    "$APP/Contents/MacOS/usage-touchbar"
+codesign --force --options runtime \
+    --identifier "$BUNDLE_ID" \
+    --sign "$IDENTITY_SHA1" \
+    "$APP"
+codesign --verify --verbose "$APP" >/dev/null 2>&1 && echo "  signature OK."
 
-codesign --verify --verbose "$BINARY" >/dev/null 2>&1 && echo "  signature OK."
+# 6. Strip the quarantine flag so Gatekeeper doesn't nag.
+xattr -cr "$APP" 2>/dev/null || true
 
-# 3b. Produce the two provider-agent binaries. They are copies of the same build
-#     signed with DISTINCT bundle identifiers so the system treats them as
-#     separate apps — the launcher (main binary) spawns these to get one Control
-#     Strip slot each.
-for AGENT in codex claude; do
-    AGENT_BINARY="$ROOT/.build/release/usage-touchbar-$AGENT"
-    cp -f "$BINARY" "$AGENT_BINARY"
-    codesign --force --options runtime \
-        --identifier "$BUNDLE_ID.$AGENT" \
-        --sign "$IDENTITY_SHA1" \
-        "$AGENT_BINARY"
-    codesign --verify "$AGENT_BINARY" >/dev/null 2>&1 && echo "  $AGENT agent signed ($BUNDLE_ID.$AGENT)."
-done
+# 7. Install to ~/Applications (user space → no admin password).
+INSTALL_DIR="$HOME/Applications"
+INSTALLED_APP="$INSTALL_DIR/UsageTouchBar.app"
+INSTALLED_BIN="$INSTALLED_APP/Contents/MacOS/usage-touchbar"
+mkdir -p "$INSTALL_DIR"
+rm -rf "$INSTALLED_APP"
+cp -R "$APP" "$INSTALL_DIR/"
+xattr -cr "$INSTALLED_APP" 2>/dev/null || true
 
-echo "✓ Built and signed: $BINARY"
-echo "  On first launch, click \"Always Allow\" on the Keychain prompt(s) once —"
-echo "  it will not ask again."
+# 8. Install/refresh the LaunchAgent so exactly ONE instance runs, points at the
+#    SIGNED installed app (never the dev build), and relaunches at login.
+LABEL="com.neelashkannan.usage-touchbar"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALLED_BIN</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>LegacyTimeout</key>
+    <string>30</string>
+</dict>
+</plist>
+PLIST_EOF
+
+# Reload: stop the old job, kill any stragglers, start the single managed copy.
+launchctl unload "$PLIST" 2>/dev/null || true
+pkill -f "usage-touchbar" 2>/dev/null || true
+sleep 1
+launchctl load "$PLIST" 2>/dev/null || true
+
+echo "✓ Built, signed, installed, and (re)launched: $INSTALLED_APP"
+echo "  On first launch, click \"Always Allow\" on the Keychain prompt ONCE —"
+echo "  with the stable signature it will not ask again."
+echo "  Arrange/hide providers from the gear on the expanded Touch Bar,"
+echo "  or in ~/.config/usage-touchbar/config.json"
 
 if [[ "${1:-}" == "--run" ]]; then
-    echo "› Launching…"
-    exec "$BINARY"
+    echo "› Already launched by launchd (KeepAlive)."
 fi

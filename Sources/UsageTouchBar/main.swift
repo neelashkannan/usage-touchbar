@@ -52,13 +52,24 @@ struct UsageSnapshot: Sendable {
 enum Provider: String, CaseIterable, Sendable {
     case claude = "Claude"
     case codex = "Codex"
+    case opencode = "OpenCode"
 
     var symbol: String { rawValue }
+
+    /// Two-letter badge used by the fallback logo glyph.
+    var badge: String {
+        switch self {
+        case .claude: "CL"
+        case .codex: "CX"
+        case .opencode: "OC"
+        }
+    }
 
     var loginURL: URL {
         switch self {
         case .claude: URL(string: "https://claude.ai/login")!
         case .codex: URL(string: "https://chatgpt.com/codex")!
+        case .opencode: URL(string: "https://opencode.ai/auth")!
         }
     }
 
@@ -66,6 +77,7 @@ enum Provider: String, CaseIterable, Sendable {
         switch self {
         case .claude: NSColor(calibratedRed: 0.85, green: 0.49, blue: 0.30, alpha: 1)
         case .codex: NSColor(calibratedWhite: 0.92, alpha: 1)
+        case .opencode: NSColor(calibratedRed: 0.36, green: 0.64, blue: 0.96, alpha: 1)
         }
     }
 }
@@ -139,6 +151,12 @@ enum AuthDetector {
                 "~/.claude/.credentials.json",
                 "~/.claude/config.json",
                 "~/.config/claude/credentials.json"
+            ]
+        case .opencode:
+            [
+                "~/.local/share/opencode/auth.json",
+                "~/.config/opencode/auth.json",
+                "~/Library/Application Support/opencode/auth.json"
             ]
         }
     }
@@ -354,38 +372,110 @@ struct CodexUsageCollector: UsageCollecting {
     }
 }
 
-/// Optional user configuration for the Claude token-budget estimate.
+/// Optional user configuration, read from `~/.config/usage-touchbar/config.json`.
 ///
-/// Anthropic does not publish exact token limits for Claude Code (they are
-/// session/weekly based and shared with the web app), so the percentage shown
-/// for Claude is an estimate against these budgets. Override them by creating
-/// `~/.config/usage-touchbar/config.json`:
+/// Anthropic does not publish exact token limits for Claude Code, so the Claude
+/// percentage is an estimate against these budgets when the live API is
+/// unavailable. The `providers` array controls which providers are shown in the
+/// Touch Bar and in what order — omit it (or leave it empty) to show all three
+/// in their default order.
 ///
-///     { "claudeFiveHourTokenBudget": 90000000, "claudeWeeklyTokenBudget": 440000000, "claudePlanLabel": "Max 20x" }
-struct AppConfig: Decodable {
+///     {
+///       "claudeFiveHourTokenBudget": 90000000,
+///       "claudeWeeklyTokenBudget": 440000000,
+///       "claudePlanLabel": "Max 20x",
+///       "providers": [
+///         { "id": "claude",   "enabled": true },
+///         { "id": "codex",    "enabled": true },
+///         { "id": "opencode", "enabled": false }
+///       ]
+///     }
+///
+/// `id` is one of "claude", "codex", "opencode". Reorder the array to reorder
+/// the Touch Bar; set `enabled` to false (or drop the entry) to hide one.
+struct ProviderSetting: Codable {
+    let id: String
+    var enabled: Bool?
+}
+
+struct AppConfig: Codable {
     var claudeFiveHourTokenBudget: Int?
     var claudeWeeklyTokenBudget: Int?
     var claudePlanLabel: String?
+    var providers: [ProviderSetting]?
 
-    static let shared = load()
+    /// Mutable so the Arrange window can apply changes without a relaunch.
+    nonisolated(unsafe) static var shared = load()
+
+    static func reload() { shared = load() }
+
+    private static var configPath: String { DataFiles.expand("~/.config/usage-touchbar/config.json") }
 
     private static func load() -> AppConfig {
-        let path = DataFiles.expand("~/.config/usage-touchbar/config.json")
-        guard let data = FileManager.default.contents(atPath: path),
+        guard let data = FileManager.default.contents(atPath: configPath),
               let config = try? JSONDecoder().decode(AppConfig.self, from: data) else {
             return AppConfig()
         }
         return config
     }
+
+    /// Writes the config to disk and updates `shared`.
+    @discardableResult
+    static func save(_ config: AppConfig) -> Bool {
+        let dir = DataFiles.expand("~/.config/usage-touchbar")
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(config) else { return false }
+        do {
+            try data.write(to: URL(fileURLWithPath: configPath))
+            shared = config
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// The providers to display, honoring the configured order + enabled flags.
+    /// Falls back to all providers in their declaration order when unconfigured.
+    var orderedVisibleProviders: [Provider] {
+        guard let providers, !providers.isEmpty else { return Provider.allCases }
+        return providers.compactMap { setting in
+            guard let provider = Self.provider(forID: setting.id) else { return nil }
+            return (setting.enabled ?? true) ? provider : nil
+        }
+    }
+
+    /// All providers in their configured order (including hidden ones), with any
+    /// providers missing from the config appended in declaration order. Used by
+    /// the Arrange window so every provider is always listed.
+    var arrangement: [(provider: Provider, enabled: Bool)] {
+        var result: [(Provider, Bool)] = []
+        var seen = Set<Provider>()
+        for setting in providers ?? [] {
+            guard let provider = Self.provider(forID: setting.id), !seen.contains(provider) else { continue }
+            result.append((provider, setting.enabled ?? true))
+            seen.insert(provider)
+        }
+        for provider in Provider.allCases where !seen.contains(provider) {
+            result.append((provider, true))
+        }
+        return result
+    }
+
+    private static func provider(forID id: String) -> Provider? {
+        Provider(rawValue: id)
+            ?? Provider.allCases.first { $0.rawValue.lowercased() == id.lowercased() }
+    }
 }
 
-/// Reads Claude's OAuth credentials from the macOS Keychain, where Claude Code
-/// stores them under the generic-password service `Claude Code-credentials`.
+/// Reads Claude's OAuth credentials.
 ///
-/// The Keychain read is **cached in memory** and only repeated once the cached
-/// token is close to expiry. Without this, every 60-second usage refresh would
-/// hit the Keychain and — on an unsigned/dev binary whose ACL entry isn't
-/// trusted — trigger a fresh "allow access" password prompt each time.
+/// To avoid the macOS "allow access" password prompt as much as possible, this
+/// reads the on-disk `~/.claude/.credentials.json` file **first** (no Keychain,
+/// no prompt) and only falls back to the Keychain (`Claude Code-credentials`)
+/// when the file is absent. The result is **cached in memory** and refreshed
+/// only near token expiry, so we never hit the Keychain on every tick.
 enum ClaudeCredentials {
     struct OAuth: Decodable {
         let accessToken: String
@@ -419,7 +509,30 @@ enum ClaudeCredentials {
         return fresh
     }
 
+    private struct Wrapper: Decodable { let claudeAiOauth: OAuth }
+
     private static func read() -> OAuth? {
+        // Prefer the on-disk credentials file — reading it never prompts.
+        if let fromFile = readFromFile() { return fromFile }
+        // Fall back to the Keychain only when the file isn't present.
+        return readFromKeychain()
+    }
+
+    private static func readFromFile() -> OAuth? {
+        let paths = [
+            "~/.claude/.credentials.json",
+            "~/.config/claude/credentials.json"
+        ]
+        for path in paths {
+            guard let data = FileManager.default.contents(atPath: DataFiles.expand(path)) else { continue }
+            if let oauth = try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth {
+                return oauth
+            }
+        }
+        return nil
+    }
+
+    private static func readFromKeychain() -> OAuth? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -431,8 +544,6 @@ enum ClaudeCredentials {
               let data = item as? Data else {
             return nil
         }
-
-        struct Wrapper: Decodable { let claudeAiOauth: OAuth }
         return try? JSONDecoder().decode(Wrapper.self, from: data).claudeAiOauth
     }
 }
@@ -655,6 +766,124 @@ struct ClaudeUsageCollector: UsageCollecting {
     }
 }
 
+/// Reads OpenCode usage from its local session storage.
+///
+/// OpenCode (sst/opencode) stores per-message records as JSON under
+/// `~/.local/share/opencode/storage/message/**` (with `tokens` + `time`
+/// fields). We sum token throughput over the rolling 5-hour and weekly windows
+/// and express it as a percentage of a budget, mirroring the Claude estimate.
+/// The reader is deliberately tolerant of schema drift and degrades to a clear
+/// message when no telemetry is found.
+struct OpenCodeUsageCollector: UsageCollecting {
+    let provider: Provider = .opencode
+
+    // Heuristic budgets; OpenCode does not publish hard limits.
+    private let fiveHourTokenBudget = 90_000_000
+    private let weeklyTokenBudget = 440_000_000
+
+    private var dataRoots: [String] {
+        [
+            "~/.local/share/opencode",
+            "~/.config/opencode",
+            "~/Library/Application Support/opencode"
+        ]
+    }
+
+    private struct Tokens: Decodable {
+        let input: Int?
+        let output: Int?
+        struct Cache: Decodable { let read: Int?; let write: Int? }
+        let cache: Cache?
+
+        var total: Int {
+            (input ?? 0) + (output ?? 0) + (cache?.read ?? 0) + (cache?.write ?? 0)
+        }
+    }
+    private struct Time: Decodable { let created: Double?; let completed: Double? }
+    private struct Record: Decodable {
+        let tokens: Tokens?
+        let time: Time?
+    }
+
+    func collect() async -> UsageSnapshot {
+        guard AuthDetector.current().isConnected(.opencode) else {
+            return .disconnected(.opencode)
+        }
+        guard let root = dataRoots
+            .map({ DataFiles.expand($0) })
+            .first(where: { FileManager.default.fileExists(atPath: $0) }) else {
+            return .failure(.opencode, message: "OpenCode data not found")
+        }
+
+        let now = Date()
+        let weekAgo = now.addingTimeInterval(-7 * 24 * 3600)
+        let fiveHoursAgo = now.addingTimeInterval(-5 * 3600)
+
+        let files = DataFiles.recentFiles(in: root, extensions: ["json", "jsonl"], modifiedAfter: weekAgo)
+        guard !files.isEmpty else {
+            return .failure(.opencode, message: "No usage in the last 7 days")
+        }
+
+        let decoder = JSONDecoder()
+        var fiveHourTokens = 0
+        var weeklyTokens = 0
+        var oldestFiveHour: Date?
+        var oldestWeekly: Date?
+        var latest = Date.distantPast
+
+        func consume(_ record: Record) {
+            guard let tokens = record.tokens?.total, tokens > 0 else { return }
+            // OpenCode timestamps are epoch milliseconds.
+            let epochMs = record.time?.completed ?? record.time?.created
+            guard let epochMs else { return }
+            let date = Date(timeIntervalSince1970: epochMs / 1000)
+            if date >= weekAgo {
+                weeklyTokens += tokens
+                latest = max(latest, date)
+                if oldestWeekly == nil || date < oldestWeekly! { oldestWeekly = date }
+            }
+            if date >= fiveHoursAgo {
+                fiveHourTokens += tokens
+                if oldestFiveHour == nil || date < oldestFiveHour! { oldestFiveHour = date }
+            }
+        }
+
+        for file in files {
+            if file.pathExtension == "jsonl" {
+                DataFiles.forEachLine(in: file) { line in
+                    guard line.contains("\"tokens\""),
+                          let data = line.data(using: .utf8),
+                          let record = try? decoder.decode(Record.self, from: data) else { return }
+                    consume(record)
+                }
+            } else if let data = try? Data(contentsOf: file),
+                      let record = try? decoder.decode(Record.self, from: data) {
+                consume(record)
+            }
+        }
+
+        guard weeklyTokens > 0 else {
+            return .failure(.opencode, message: "No usage telemetry yet")
+        }
+
+        let dailyPercent = min(100, Double(fiveHourTokens) / Double(fiveHourTokenBudget) * 100)
+        let weeklyPercent = min(100, Double(weeklyTokens) / Double(weeklyTokenBudget) * 100)
+
+        return UsageSnapshot(
+            provider: .opencode,
+            isConnected: true,
+            dailyPercent: dailyPercent,
+            weeklyPercent: weeklyPercent,
+            dailyResetAt: oldestFiveHour?.addingTimeInterval(5 * 3600),
+            weeklyResetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600),
+            totalTokens: weeklyTokens,
+            planLabel: "est.",
+            updatedAt: latest == .distantPast ? now : latest,
+            error: nil
+        )
+    }
+}
+
 @MainActor
 final class TouchBarHostPanel: NSPanel {
     weak var touchBarController: TouchBarController?
@@ -868,6 +1097,137 @@ final class LoginViewController: NSViewController {
     }
 }
 
+/// Settings window for arranging the Touch Bar: show/hide each provider and set
+/// their left-to-right order. Opened from the gear button on the expanded
+/// Touch Bar (there is no menu-bar item).
+@MainActor
+final class ArrangeViewController: NSViewController {
+    private let onApply: ([(provider: Provider, enabled: Bool)]) -> Void
+    private var items: [(provider: Provider, enabled: Bool)]
+    private let stack = NSStackView()
+
+    init(onApply: @escaping ([(provider: Provider, enabled: Bool)]) -> Void) {
+        self.onApply = onApply
+        self.items = AppConfig.shared.arrangement
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 280))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -18)
+        ])
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        render()
+    }
+
+    /// Reloads the rows from the current saved config.
+    func refresh() {
+        items = AppConfig.shared.arrangement
+        render()
+    }
+
+    private func render() {
+        stack.arrangedSubviews.forEach {
+            stack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+
+        let title = NSTextField(labelWithString: "Arrange Touch Bar")
+        title.font = .systemFont(ofSize: 18, weight: .bold)
+        stack.addArrangedSubview(title)
+
+        let note = NSTextField(wrappingLabelWithString: "Check to show a provider; use ↑ ↓ to set the left-to-right order. Click Apply.")
+        note.font = .systemFont(ofSize: 12)
+        note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = 324
+        stack.addArrangedSubview(note)
+        stack.setCustomSpacing(14, after: note)
+
+        for (index, item) in items.enumerated() {
+            stack.addArrangedSubview(row(index: index, item: item))
+        }
+
+        let apply = NSButton(title: "Apply", target: self, action: #selector(applyTapped))
+        apply.bezelStyle = .rounded
+        apply.keyEquivalent = "\r"
+        if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(16, after: last) }
+        stack.addArrangedSubview(apply)
+    }
+
+    private func row(index: Int, item: (provider: Provider, enabled: Bool)) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 324).isActive = true
+
+        let check = NSButton(checkboxWithTitle: item.provider.rawValue, target: self, action: #selector(toggle(_:)))
+        check.state = item.enabled ? .on : .off
+        check.tag = index
+        check.translatesAutoresizingMaskIntoConstraints = false
+        check.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        row.addArrangedSubview(check)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        let up = NSButton(title: "↑", target: self, action: #selector(moveRowUp(_:)))
+        up.bezelStyle = .rounded
+        up.tag = index
+        up.isEnabled = index > 0
+        row.addArrangedSubview(up)
+
+        let down = NSButton(title: "↓", target: self, action: #selector(moveRowDown(_:)))
+        down.bezelStyle = .rounded
+        down.tag = index
+        down.isEnabled = index < items.count - 1
+        row.addArrangedSubview(down)
+
+        return row
+    }
+
+    @objc private func toggle(_ sender: NSButton) {
+        guard items.indices.contains(sender.tag) else { return }
+        items[sender.tag].enabled = sender.state == .on
+    }
+
+    @objc private func moveRowUp(_ sender: NSButton) {
+        let i = sender.tag
+        guard i > 0, items.indices.contains(i) else { return }
+        items.swapAt(i, i - 1)
+        render()
+    }
+
+    @objc private func moveRowDown(_ sender: NSButton) {
+        let i = sender.tag
+        guard items.indices.contains(i), i < items.count - 1 else { return }
+        items.swapAt(i, i + 1)
+        render()
+    }
+
+    @objc private func applyTapped() {
+        onApply(items)
+    }
+}
+
 final class ProviderLogoView: NSView {
     private let provider: Provider
     private let selected: Bool
@@ -900,6 +1260,9 @@ final class ProviderLogoView: NSView {
         case .claude:
             fill = selected ? NSColor(calibratedRed: 0.63, green: 0.35, blue: 0.20, alpha: 1) : NSColor(calibratedRed: 0.45, green: 0.33, blue: 0.25, alpha: 1)
             stroke = NSColor(calibratedRed: 0.86, green: 0.73, blue: 0.58, alpha: 1)
+        case .opencode:
+            fill = selected ? NSColor(calibratedRed: 0.16, green: 0.34, blue: 0.55, alpha: 1) : NSColor(calibratedRed: 0.20, green: 0.30, blue: 0.42, alpha: 1)
+            stroke = NSColor(calibratedRed: 0.55, green: 0.76, blue: 0.98, alpha: 1)
         }
 
         fill.setFill()
@@ -909,7 +1272,7 @@ final class ProviderLogoView: NSView {
         path.fill()
         path.stroke()
 
-        let text = provider == .codex ? "CX" : "CL"
+        let text = provider.badge
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.boldSystemFont(ofSize: 10),
             .foregroundColor: NSColor.white
@@ -936,6 +1299,9 @@ enum ProviderBranding {
         case .codex:
             bundleID = "com.openai.codex"
             fallbackPath = "/Applications/Codex.app"
+        case .opencode:
+            bundleID = "ai.opencode.app"
+            fallbackPath = "/Applications/OpenCode.app"
         }
         let workspace = NSWorkspace.shared
         let url = workspace.urlForApplication(withBundleIdentifier: bundleID)
@@ -1107,6 +1473,9 @@ final class UsageBarView: NSView {
         let barWidth = bounds.maxX - valueSize.width - 5 - barX
         if barWidth > 6 {
             let barHeight: CGFloat = 3
+            let trackRect = NSRect(x: barX, y: topMidY - barHeight / 2, width: barWidth, height: barHeight)
+            NSColor(white: 1, alpha: 0.14).setFill()
+            NSBezierPath(roundedRect: trackRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
             if let percent {
                 let clamped = max(0, min(100, percent))
                 let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
@@ -1239,6 +1608,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     static let claudeIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.claude")
     static let detailIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.detail")
     static let refreshIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.refresh")
+    static let settingsIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.settings")
 
     static let controlStripIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.controlStrip")
 
@@ -1272,6 +1642,23 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         defer: false
     )
     private lazy var hostPanel = TouchBarHostPanel(touchBarController: self)
+    private var arrangeVC: ArrangeViewController?
+    private lazy var arrangeWindow: NSWindow = {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 280),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Usage Touch Bar"
+        window.isReleasedWhenClosed = false
+        let vc = ArrangeViewController { [weak self] items in
+            self?.applyArrangement(items)
+        }
+        arrangeVC = vc
+        window.contentViewController = vc
+        return window
+    }()
     private weak var summaryItem: NSCustomTouchBarItem?
     private weak var detailItem: NSCustomTouchBarItem?
     private weak var codexButton: NSButton?
@@ -1286,12 +1673,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         self.store = store
         self.mode = mode
         if case .agent(let provider) = mode { self.selectedProvider = provider }
-        // Only the launcher shows a menu-bar item.
-        self.statusItem = mode == .launcher
-            ? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            : nil
+        // Menu-bar item shows all enabled providers' usage at a glance.
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
-        if mode == .launcher { configureStatusItem() }
+        configureStatusItem()
         configureTouchBar()
         configurePopover()
         configureLoginWindow()
@@ -1350,27 +1735,133 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             button.toolTip = "Refresh"
             item.view = button
             return item
+        case Self.settingsIdentifier:
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let button = NSButton(
+                image: NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Arrange")!,
+                target: self,
+                action: #selector(showSettings)
+            )
+            button.isBordered = false
+            button.bezelStyle = .texturedRounded
+            button.toolTip = "Arrange providers"
+            item.view = button
+            return item
         default:
             return nil
         }
     }
 
+    /// Opens the Arrange window (show/hide + reorder providers).
+    @objc private func showSettings() {
+        let window = arrangeWindow   // triggers lazy init + sets arrangeVC
+        arrangeVC?.refresh()
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Persists a new arrangement and applies it live (no relaunch needed).
+    private func applyArrangement(_ items: [(provider: Provider, enabled: Bool)]) {
+        var config = AppConfig.shared
+        config.providers = items.map {
+            ProviderSetting(id: $0.provider.rawValue.lowercased(), enabled: $0.enabled)
+        }
+        AppConfig.save(config)
+        AppConfig.reload()
+        teardownControlStripItem()
+        installControlStripItem()
+        refreshTouchBar()
+        arrangeVC?.refresh()
+    }
+
     private func configureStatusItem() {
         guard let statusItem else { return }
-        statusItem.button?.title = "Usage"
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(togglePopover)
+        if let button = statusItem.button {
+            button.attributedTitle = statusAttributedTitle()
+            button.imagePosition = .noImage
+        }
+        rebuildStatusMenu()
+    }
 
+    /// A compact, color-graded menu-bar title showing every enabled provider's
+    /// 5-hour usage, e.g.  CL 39%  CX 12%  OC –  (each percent tinted by load).
+    private func statusAttributedTitle() -> NSAttributedString {
+        let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
+        let providers = visibleProviders
+        let result = NSMutableAttributedString()
+
+        let labelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold)
+
+        for (index, provider) in providers.enumerated() {
+            if index > 0 {
+                result.append(NSAttributedString(string: "  ", attributes: [.font: labelFont]))
+            }
+            result.append(NSAttributedString(string: provider.badge + " ", attributes: [
+                .font: labelFont,
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]))
+            let snapshot = snapshots[provider]
+            if let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent {
+                result.append(NSAttributedString(string: "\(Int(percent.rounded()))%", attributes: [
+                    .font: valueFont,
+                    .foregroundColor: UsageFormat.color(forPercent: percent)
+                ]))
+            } else {
+                result.append(NSAttributedString(string: "–", attributes: [
+                    .font: valueFont,
+                    .foregroundColor: NSColor.tertiaryLabelColor
+                ]))
+            }
+        }
+        if result.length == 0 {
+            return NSAttributedString(string: "Usage", attributes: [.font: labelFont])
+        }
+        return result
+    }
+
+    /// Rebuilds the menu-bar dropdown with a live per-provider usage breakdown
+    /// plus Refresh / Arrange / Connect / Quit actions.
+    private func rebuildStatusMenu() {
+        guard let statusItem else { return }
+        let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
         let menu = NSMenu()
+
+        let title = NSMenuItem(title: "Usage", action: nil, keyEquivalent: "")
+        title.isEnabled = false
+        menu.addItem(title)
+        menu.addItem(.separator())
+
+        for provider in visibleProviders {
+            let snapshot = snapshots[provider]
+            let detail: String
+            if let snapshot, snapshot.error == nil {
+                let five = UsageFormat.percentText(snapshot.dailyPercent)
+                let week = UsageFormat.percentText(snapshot.weeklyPercent)
+                detail = "  5h \(five)  ·  Wk \(week)"
+            } else if let snapshot, let error = snapshot.error {
+                detail = "  \(error)"
+            } else {
+                detail = "  –"
+            }
+            let item = NSMenuItem(title: "\(provider.rawValue)\(detail)", action: nil, keyEquivalent: "")
+            item.image = ProviderBranding.icon(for: provider, size: 16)
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+
+        menu.addItem(.separator())
+
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshButtonPressed), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
-        let showItem = NSMenuItem(title: "Show Usage", action: #selector(togglePopover), keyEquivalent: "u")
-        showItem.target = self
-        menu.addItem(showItem)
+        let arrangeItem = NSMenuItem(title: "Arrange…", action: #selector(showSettings), keyEquivalent: "a")
+        arrangeItem.target = self
+        menu.addItem(arrangeItem)
 
-        let loginItem = NSMenuItem(title: "Connect Accounts", action: #selector(showLoginWindow), keyEquivalent: "l")
+        let loginItem = NSMenuItem(title: "Connect Accounts…", action: #selector(showLoginWindow), keyEquivalent: "l")
         loginItem.target = self
         menu.addItem(loginItem)
 
@@ -1388,8 +1879,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func configureTouchBar() {
         touchBar.delegate = self
-        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier]
-        touchBar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+        touchBar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
         touchBar.customizationIdentifier = NSTouchBar.CustomizationIdentifier("UsageTouchBar.default")
         touchBar.principalItemIdentifier = Self.detailIdentifier
     }
@@ -1436,6 +1927,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         return image
     }
 
+    /// Providers to show, in the order/visibility chosen in the config file.
+    private var visibleProviders: [Provider] {
+        let providers = AppConfig.shared.orderedVisibleProviders
+        return providers.isEmpty ? Provider.allCases : providers
+    }
+
     private func makeDetailView() -> NSView {
         let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
 
@@ -1446,7 +1943,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         row.edgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        for provider in [Provider.codex, Provider.claude] {
+        let providers = visibleProviders
+        for (index, provider) in providers.enumerated() {
             let snapshot = snapshots[provider]
 
             // Brand icon.
@@ -1487,8 +1985,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
                 row.addArrangedSubview(label(snapshot?.error ?? "—", color: .systemOrange, bold: false, size: 10))
             }
 
-            // Accent-tinted vertical hairline between Codex and Claude.
-            if provider == .codex {
+            // Accent-tinted vertical hairline between providers.
+            if index < providers.count - 1 {
                 row.addArrangedSubview(VerticalSeparatorView(color: provider.accentColor.withAlphaComponent(0.35)))
             }
         }
@@ -1521,11 +2019,13 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         row.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 6)
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        let codexButton = summaryButton(provider: Provider.codex, snapshot: snapshots[Provider.codex])
-        row.addArrangedSubview(codexButton)
+        let providers = visibleProviders
+        for provider in providers {
+            row.addArrangedSubview(summaryButton(provider: provider, snapshot: snapshots[provider]))
+        }
 
-        let claudeButton = summaryButton(provider: Provider.claude, snapshot: snapshots[Provider.claude])
-        row.addArrangedSubview(claudeButton)
+        let count = max(1, providers.count)
+        let containerWidth = CGFloat(count) * 153 + CGFloat(count - 1) * 4 + 16
 
         let container = NSView()
         container.wantsLayer = true
@@ -1535,7 +2035,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
         NSLayoutConstraint.activate([
             container.heightAnchor.constraint(equalToConstant: 30),
-            container.widthAnchor.constraint(equalToConstant: 322),
+            container.widthAnchor.constraint(equalToConstant: containerWidth),
             row.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             row.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             row.topAnchor.constraint(equalTo: container.topAnchor),
@@ -1584,19 +2084,10 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             controlStripButton.image = makeControlStripTriggerImage()
             controlStripButton.needsDisplay = true
         }
-        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier]
-        statusItem?.button?.title = statusTitle()
+        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
+        statusItem?.button?.attributedTitle = statusAttributedTitle()
+        rebuildStatusMenu()
         (popover.contentViewController as? UsageViewController)?.reload()
-    }
-
-    private func statusTitle() -> String {
-        let snapshots = store.currentSnapshots()
-        guard !snapshots.isEmpty else { return "Usage" }
-        let parts = snapshots.map { snapshot -> String in
-            if snapshot.error != nil { return "\(snapshot.provider.symbol) –" }
-            return "\(snapshot.provider.symbol) \(UsageFormat.percentText(snapshot.dailyPercent))"
-        }
-        return parts.joined(separator: "  ")
     }
 
     @objc private func refreshButtonPressed() {
@@ -1620,7 +2111,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         claudeButton?.image = makeLogoImage(provider: .claude, selected: selectedProvider == .claude)
         summaryItem?.view = makeSummaryView()
         detailItem?.view = makeDetailView()
-        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.defaultItemIdentifiers = [Self.detailIdentifier, Self.refreshIdentifier, Self.settingsIdentifier]
     }
 
     private func installControlStripItem() {
@@ -1638,7 +2129,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             itemIdentifier = Self.controlStripIdentifier(for: ownedProvider)
         } else {
             removeLegacyControlStripItems()
-            providers = [.codex, .claude]
+            providers = visibleProviders
             itemIdentifier = Self.controlStripIdentifier
         }
 
@@ -1727,34 +2218,48 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 
-        let iconRect = NSRect(x: 1, y: 1, width: 22, height: 22)
-        NSColor(white: 0.14, alpha: 1).setFill()
-        let background = NSBezierPath(roundedRect: iconRect, xRadius: 6, yRadius: 6)
-        background.fill()
+        // Chip background: a soft vertical gradient (never pure black) with a
+        // hairline top highlight — a clean, minimal "Flat 2.0" depth cue.
+        let chipRect = NSRect(x: 0.5, y: 0.5, width: 23, height: 23)
+        let chip = NSBezierPath(roundedRect: chipRect, xRadius: 6.5, yRadius: 6.5)
+        let bg = NSGradient(colors: [
+            NSColor(white: 0.20, alpha: 1),
+            NSColor(white: 0.11, alpha: 1)
+        ])
+        bg?.draw(in: chip, angle: -90)
+        NSColor(white: 1, alpha: 0.06).setStroke()
+        chip.lineWidth = 1
+        chip.stroke()
 
-        // Two mini vertical gauges — one per provider — that fill from the
-        // bottom by real 5-hour usage and take on the usage color, so the
-        // always-visible Control Strip glyph reflects live state at a glance.
+        // One slim vertical gauge per visible provider — an equalizer that fills
+        // from the bottom by 5-hour usage, tinted green→amber→red by load. The
+        // empty track keeps a faint provider-accent tint for identity.
         let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
-        let slots: [(provider: Provider, x: CGFloat)] = [(.codex, 5), (.claude, 13)]
+        let providers = visibleProviders
         let trackY: CGFloat = 5
         let trackHeight: CGFloat = 14
-        let barWidth: CGFloat = 6
-        for slot in slots {
+        let count = max(1, providers.count)
+        let barWidth: CGFloat = count >= 3 ? 3.5 : 5
+        let regionMinX: CGFloat = 4
+        let regionMaxX: CGFloat = 20
+        let gap = count > 1 ? (regionMaxX - regionMinX - barWidth * CGFloat(count)) / CGFloat(count - 1) : 0
+        let radius = barWidth / 2
+        for (i, provider) in providers.enumerated() {
+            let x = count == 1 ? (24 - barWidth) / 2 : regionMinX + CGFloat(i) * (barWidth + gap)
             let track = NSBezierPath(
-                roundedRect: NSRect(x: slot.x, y: trackY, width: barWidth, height: trackHeight),
-                xRadius: 2, yRadius: 2
+                roundedRect: NSRect(x: x, y: trackY, width: barWidth, height: trackHeight),
+                xRadius: radius, yRadius: radius
             )
-            NSColor(white: 0.32, alpha: 1).setFill()
+            provider.accentColor.withAlphaComponent(0.22).setFill()
             track.fill()
 
-            let snapshot = snapshots[slot.provider]
+            let snapshot = snapshots[provider]
             guard let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent else { continue }
             let clamped = max(0, min(100, percent))
-            let fillHeight = max(2, trackHeight * CGFloat(clamped / 100))
+            let fillHeight = max(barWidth, trackHeight * CGFloat(clamped / 100))
             let fill = NSBezierPath(
-                roundedRect: NSRect(x: slot.x, y: trackY, width: barWidth, height: fillHeight),
-                xRadius: 2, yRadius: 2
+                roundedRect: NSRect(x: x, y: trackY, width: barWidth, height: fillHeight),
+                xRadius: radius, yRadius: radius
             )
             UsageFormat.color(forPercent: clamped).setFill()
             fill.fill()
@@ -1847,8 +2352,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let barMaxX = width - weeklySize.width - 8
         let barWidth = barMaxX - barX
         if barWidth > 6 {
-            let barHeight: CGFloat = 3
-            let barY: CGFloat = 4
+            let barHeight: CGFloat = 3.5
+            let barY: CGFloat = 3.5
+            // Rounded track behind the fill so partial usage still reads as a gauge.
+            let trackRect = NSRect(x: barX, y: barY, width: barWidth, height: barHeight)
+            NSColor(white: 1, alpha: 0.14).setFill()
+            NSBezierPath(roundedRect: trackRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
             if let dailyPercent {
                 let clamped = max(0, min(100, dailyPercent))
                 let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
@@ -2240,33 +2749,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: TouchBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // `--agent <provider>` runs a single-provider agent that owns one Control
-        // Strip slot. With no flag we are the launcher: menu bar + one combined
-        // Control Strip item containing Codex and Claude buttons side by side.
-        let args = CommandLine.arguments
-        let agentProvider = args.firstIndex(of: "--agent")
-            .flatMap { args.indices.contains($0 + 1) ? Provider(rawValue: args[$0 + 1]) : nil }
-
-        let mode: TouchBarController.Mode = agentProvider.map { .agent($0) } ?? .launcher
-
-        // An agent only needs its own provider's collector (keeps it light and
-        // avoids touching the other provider's credentials).
-        let collectors: [UsageCollecting]
-        switch mode {
-        case .agent(.claude): collectors = [ClaudeUsageCollector()]
-        case .agent(.codex): collectors = [CodexUsageCollector()]
-        case .launcher: collectors = [ClaudeUsageCollector(), CodexUsageCollector()]
-        }
-
-        // An agent reparented to launchd (ppid == 1) means the launcher died —
-        // quit so the slot doesn't linger.
-        if mode != .launcher {
-            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-                if getppid() == 1 { Task { @MainActor in NSApp.terminate(nil) } }
-            }
-        }
-
-        let controller = TouchBarController(store: UsageStore(collectors: collectors), mode: mode)
+        // One single app/process: all providers are shown together in one
+        // Control Strip slot. (The legacy `--agent` multi-process mode that
+        // produced separate binaries — and separate Keychain prompts — is gone.)
+        let collectors: [UsageCollecting] = [
+            ClaudeUsageCollector(),
+            CodexUsageCollector(),
+            OpenCodeUsageCollector()
+        ]
+        let controller = TouchBarController(store: UsageStore(collectors: collectors), mode: .launcher)
         self.controller = controller
         controller.start()
     }

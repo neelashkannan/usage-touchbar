@@ -1,0 +1,72 @@
+name: Release
+
+# Build a signed (ad-hoc) UsageTouchBar.app and attach it to a GitHub Release
+# whenever a v* tag is pushed (e.g. v1, v1.0.0). Also runnable on demand.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Assemble & ad-hoc sign app bundle
+        run: |
+          set -euo pipefail
+          APP="UsageTouchBar.app"
+          BIN=".build/release/usage-touchbar"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/usage-touchbar"
+          cp Info.plist "$APP/Contents/Info.plist"
+          # Ad-hoc signature (no Apple Developer account needed on CI).
+          codesign --force --options runtime \
+            --identifier "com.neelashkannan.usage-touchbar" \
+            --sign - "$APP/Contents/MacOS/usage-touchbar"
+          codesign --force --options runtime \
+            --identifier "com.neelashkannan.usage-touchbar" \
+            --sign - "$APP"
+          codesign --verify --verbose "$APP"
+
+      - name: Package zip
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent UsageTouchBar.app UsageTouchBar.zip
+          shasum -a 256 UsageTouchBar.zip | tee UsageTouchBar.zip.sha256
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            UsageTouchBar.zip
+            UsageTouchBar.zip.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Usage Touch Bar ${{ github.ref_name }}
+
+            macOS Touch Bar app showing **Claude, Codex, and OpenCode** usage limits,
+            with a live menu-bar readout and an Arrange panel.
+
+            ### Install
+            1. Download `UsageTouchBar.zip` below and unzip.
+            2. Move `UsageTouchBar.app` to `~/Applications` (or `/Applications`).
+            3. The build is **ad-hoc signed**, so on first launch right-click →
+               **Open** (or run `xattr -cr UsageTouchBar.app` to clear quarantine).
+            4. Click **Always Allow** once on the Keychain prompt.
+
+            Requires macOS 13+ with a Touch Bar.
