@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import Security
 
-/// A structured, real-data snapshot of a provider's usage.
+/// A structured, reale-data snapshot of a provider's usage.
 ///
 /// `dailyPercent` / `weeklyPercent` are the share of the rolling primary
 /// (5-hour) and secondary (weekly) limit windows that have been consumed.
@@ -381,13 +381,45 @@ struct AppConfig: Decodable {
 
 /// Reads Claude's OAuth credentials from the macOS Keychain, where Claude Code
 /// stores them under the generic-password service `Claude Code-credentials`.
+///
+/// The Keychain read is **cached in memory** and only repeated once the cached
+/// token is close to expiry. Without this, every 60-second usage refresh would
+/// hit the Keychain and — on an unsigned/dev binary whose ACL entry isn't
+/// trusted — trigger a fresh "allow access" password prompt each time.
 enum ClaudeCredentials {
     struct OAuth: Decodable {
         let accessToken: String
         let subscriptionType: String?
+        /// Unix epoch in milliseconds when the access token expires.
+        let expiresAt: Double?
+
+        var expiryDate: Date? {
+            expiresAt.map { Date(timeIntervalSince1970: $0 / 1000) }
+        }
     }
 
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var cached: OAuth?
+
     static func current() -> OAuth? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Reuse the cached token until it is within 2 minutes of expiry.
+        if let cached, let expiry = cached.expiryDate, expiry.timeIntervalSinceNow > 120 {
+            return cached
+        }
+
+        guard let fresh = read() else {
+            // Keychain unavailable this time (e.g. user clicked Deny): keep using
+            // the last good token if we still have one rather than failing hard.
+            return cached
+        }
+        cached = fresh
+        return fresh
+    }
+
+    private static func read() -> OAuth? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -444,6 +476,9 @@ struct ClaudeUsageCollector: UsageCollecting {
 
         var request = URLRequest(url: Self.usageURL)
         request.timeoutInterval = 8
+        // Always hit the network — a cached GET response would freeze the usage
+        // numbers and make refreshes look like they do nothing.
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -646,7 +681,7 @@ final class LoginViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 320))
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -673,49 +708,103 @@ final class LoginViewController: NSViewController {
         }
 
         let title = NSTextField(labelWithString: "Connect Accounts")
-        title.font = .boldSystemFont(ofSize: 17)
+        title.font = .systemFont(ofSize: 18, weight: .bold)
         stack.addArrangedSubview(title)
 
-        let note = NSTextField(wrappingLabelWithString: "Usage Touch Bar needs local Codex and Claude Code login state before it shows provider usage.")
+        let note = NSTextField(wrappingLabelWithString: "Usage Touch Bar reads local Codex and Claude Code login state before it shows provider usage. Sign in to each provider below.")
         note.font = .systemFont(ofSize: 12)
         note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = 384
         stack.addArrangedSubview(note)
 
+        stack.setCustomSpacing(16, after: note)
+
         let auth = AuthDetector.current()
+        var lastRow: NSView?
         for provider in Provider.allCases {
-            stack.addArrangedSubview(row(provider: provider, connected: auth.isConnected(provider)))
+            let providerRow = row(provider: provider, connected: auth.isConnected(provider))
+            stack.addArrangedSubview(providerRow)
+            lastRow = providerRow
         }
 
         let refresh = NSButton(title: "Check Again", target: self, action: #selector(checkAgain))
+        refresh.bezelStyle = .rounded
+        refresh.keyEquivalent = "\r"
+        if let lastRow { stack.setCustomSpacing(16, after: lastRow) }
         stack.addArrangedSubview(refresh)
     }
 
     private func row(provider: Provider, connected: Bool) -> NSView {
+        let box = NSBox()
+        box.boxType = .custom
+        box.titlePosition = .noTitle
+        box.cornerRadius = 10
+        box.borderWidth = 1
+        box.borderColor = .separatorColor
+        box.fillColor = .clear
+        box.translatesAutoresizingMaskIntoConstraints = false
+        box.widthAnchor.constraint(equalToConstant: 384).isActive = true
+
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        box.contentView?.addSubview(row)
+        if let host = box.contentView {
+            NSLayoutConstraint.activate([
+                row.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 12),
+                row.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -12),
+                row.topAnchor.constraint(equalTo: host.topAnchor, constant: 10),
+                row.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10)
+            ])
+        }
 
-        let icon = ProviderLogoView(provider: provider, selected: connected)
+        let icon = NSImageView(image: ProviderBranding.icon(for: provider, size: 28))
+        icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
         row.addArrangedSubview(icon)
 
-        let label = NSTextField(labelWithString: "\(provider.rawValue): \(connected ? "connected" : "login required")")
-        label.font = .systemFont(ofSize: 13)
-        label.textColor = connected ? .labelColor : .systemOrange
-        row.addArrangedSubview(label)
+        let labels = NSStackView()
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 1
+
+        let name = NSTextField(labelWithString: provider.rawValue)
+        name.font = .systemFont(ofSize: 13, weight: .semibold)
+        labels.addArrangedSubview(name)
+
+        let statusRow = NSStackView()
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 5
+
+        let dot = StatusDotView(color: connected ? .systemGreen : .systemOrange)
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.widthAnchor.constraint(equalToConstant: 7).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 7).isActive = true
+        statusRow.addArrangedSubview(dot)
+
+        let status = NSTextField(labelWithString: connected ? "Connected" : "Login required")
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = connected ? .secondaryLabelColor : .systemOrange
+        statusRow.addArrangedSubview(status)
+        labels.addArrangedSubview(statusRow)
+
+        row.addArrangedSubview(labels)
 
         let spacer = NSView()
-        row.addArrangedSubview(spacer)
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
 
         let button = NSButton(title: connected ? "Open" : "Login", target: self, action: #selector(openLogin(_:)))
+        button.bezelStyle = .rounded
         button.identifier = NSUserInterfaceItemIdentifier(provider.rawValue)
         row.addArrangedSubview(button)
 
-        return row
+        return box
     }
 
     @objc private func checkAgain() {
@@ -786,6 +875,134 @@ final class ProviderLogoView: NSView {
     }
 }
 
+/// Shared source for each provider's brand icon, used by the popover and the
+/// Connect Accounts window so both surfaces show the real desktop-app glyph
+/// (falling back to the `CL`/`CX` badge when the app isn't installed).
+enum ProviderBranding {
+    static func appIcon(for provider: Provider) -> NSImage? {
+        let bundleID: String
+        let fallbackPath: String
+        switch provider {
+        case .claude:
+            bundleID = "com.anthropic.claudefordesktop"
+            fallbackPath = "/Applications/Claude.app"
+        case .codex:
+            bundleID = "com.openai.codex"
+            fallbackPath = "/Applications/Codex.app"
+        }
+        let workspace = NSWorkspace.shared
+        let url = workspace.urlForApplication(withBundleIdentifier: bundleID)
+            ?? (FileManager.default.fileExists(atPath: fallbackPath) ? URL(fileURLWithPath: fallbackPath) : nil)
+        guard let url else { return nil }
+        return workspace.icon(forFile: url.path)
+    }
+
+    @MainActor
+    static func icon(for provider: Provider, size: CGFloat) -> NSImage {
+        if let appIcon = appIcon(for: provider) {
+            let copy = appIcon.copy() as! NSImage
+            copy.size = NSSize(width: size, height: size)
+            return copy
+        }
+        let view = ProviderLogoView(provider: provider, selected: true)
+        view.frame = NSRect(x: 0, y: 0, width: size, height: size)
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+            return NSImage(size: NSSize(width: size, height: size))
+        }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        let image = NSImage(size: view.bounds.size)
+        image.addRepresentation(rep)
+        return image
+    }
+}
+
+/// A full-width labeled limit gauge for the menu-bar popover:
+/// `5-hour  ▓▓▓░░░░░  19%` with the fill color-graded by consumption.
+final class PopoverLimitBar: NSView {
+    private let caption: String
+    private let percent: Double?
+
+    init(caption: String, percent: Double?) {
+        self.caption = caption
+        self.percent = percent
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: 18)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let captionAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let valueAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        let midY = bounds.midY
+
+        let captionSize = caption.size(withAttributes: captionAttrs)
+        caption.draw(at: NSPoint(x: 0, y: midY - captionSize.height / 2), withAttributes: captionAttrs)
+
+        let valueText = UsageFormat.percentText(percent)
+        let valueSize = valueText.size(withAttributes: valueAttrs)
+        valueText.draw(
+            at: NSPoint(x: bounds.maxX - valueSize.width, y: midY - valueSize.height / 2),
+            withAttributes: valueAttrs
+        )
+
+        let barX: CGFloat = 62
+        let barMaxX = bounds.maxX - valueSize.width - 12
+        let barWidth = barMaxX - barX
+        guard barWidth > 4 else { return }
+
+        let barHeight: CGFloat = 6
+        let trackRect = NSRect(x: barX, y: midY - barHeight / 2, width: barWidth, height: barHeight)
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: trackRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+
+        guard let percent else { return }
+        let clamped = max(0, min(100, percent))
+        let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
+        let fillRect = NSRect(x: barX, y: trackRect.minY, width: fillWidth, height: barHeight)
+        UsageFormat.color(forPercent: clamped).setFill()
+        NSBezierPath(roundedRect: fillRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+    }
+}
+
+/// A small status dot used in the popover to signal a provider's headline health.
+final class StatusDotView: NSView {
+    private let color: NSColor
+
+    init(color: NSColor) {
+        self.color = color
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 8, height: 8) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        color.setFill()
+        NSBezierPath(ovalIn: bounds.insetBy(dx: 0.5, dy: 0.5)).fill()
+    }
+}
+
 /// A compact inline gauge sized to fit the ~30pt Touch Bar strip:
 /// `5h ▓▓▓░ 19%` on a single vertically-centered line.
 final class UsageBarView: NSView {
@@ -847,6 +1064,11 @@ final class UsageBarView: NSView {
         UsageFormat.color(forPercent: clamped).setFill()
         fill.fill()
     }
+}
+
+@MainActor
+final class ControlStripSummaryButton: NSButton {
+    var providers: [Provider] = []
 }
 
 
@@ -930,37 +1152,64 @@ enum ControlStrip {
 
 @MainActor
 final class TouchBarController: NSObject, NSTouchBarDelegate {
+    static let summaryIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.summary")
     static let codexIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.codex")
     static let claudeIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.claude")
     static let detailIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.detail")
     static let refreshIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.refresh")
+
     static let controlStripIdentifier = NSTouchBarItem.Identifier("UsageTouchBar.controlStrip")
 
+    /// Per-provider Control Strip identifier retained for agent fallback builds.
+    static func controlStripIdentifier(for provider: Provider) -> NSTouchBarItem.Identifier {
+        NSTouchBarItem.Identifier("UsageTouchBar.controlStrip.\(provider.rawValue)")
+    }
+
+    /// Running mode: the launcher (menu bar + combined Control Strip item) or a
+    /// single-provider agent fallback.
+    enum Mode: Equatable {
+        case launcher
+        case agent(Provider)
+    }
+
+    private let mode: Mode
+    /// The provider this process's Control Strip slot represents (nil for launcher).
+    private var ownedProvider: Provider? {
+        if case .agent(let provider) = mode { return provider }
+        return nil
+    }
+
     private let store: UsageStore
-    private let statusItem: NSStatusItem
+    private let statusItem: NSStatusItem?
     private let touchBar = NSTouchBar()
     private let popover = NSPopover()
     private let loginWindow = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 420, height: 240),
+        contentRect: NSRect(x: 0, y: 0, width: 420, height: 320),
         styleMask: [.titled, .closable],
         backing: .buffered,
         defer: false
     )
     private lazy var hostPanel = TouchBarHostPanel(touchBarController: self)
+    private weak var summaryItem: NSCustomTouchBarItem?
     private weak var detailItem: NSCustomTouchBarItem?
     private weak var codexButton: NSButton?
     private weak var claudeButton: NSButton?
     private var controlStripItem: NSCustomTouchBarItem?
-    private weak var controlStripButton: NSButton?
+    private weak var controlStripButton: ControlStripSummaryButton?
     private var selectedProvider: Provider = .codex
     private var authState = AuthDetector.current()
     private var timer: Timer?
 
-    init(store: UsageStore) {
+    init(store: UsageStore, mode: Mode) {
         self.store = store
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.mode = mode
+        if case .agent(let provider) = mode { self.selectedProvider = provider }
+        // Only the launcher shows a menu-bar item.
+        self.statusItem = mode == .launcher
+            ? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            : nil
         super.init()
-        configureStatusItem()
+        if mode == .launcher { configureStatusItem() }
         configureTouchBar()
         configurePopover()
         configureLoginWindow()
@@ -968,10 +1217,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     func start() {
         NSApp.touchBar = touchBar
-        installControlStripItem()
-        showLoginIfNeeded()
+        if mode == .launcher {
+            showLoginIfNeeded()
+            installControlStripItem()
+        } else {
+            installControlStripItem()
+        }
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
@@ -989,6 +1242,11 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
         switch identifier {
+        case Self.summaryIdentifier:
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            item.view = makeSummaryView()
+            summaryItem = item
+            return item
         case Self.codexIdentifier:
             return providerButtonItem(identifier: identifier, provider: .codex)
         case Self.claudeIdentifier:
@@ -1010,6 +1268,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     private func configureStatusItem() {
+        guard let statusItem else { return }
         statusItem.button?.title = "Usage"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
@@ -1041,15 +1300,15 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func configureTouchBar() {
         touchBar.delegate = self
-        touchBar.defaultItemIdentifiers = [Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
-        touchBar.customizationAllowedItemIdentifiers = [Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.defaultItemIdentifiers = [Self.summaryIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        touchBar.customizationAllowedItemIdentifiers = [Self.summaryIdentifier, Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
         touchBar.customizationIdentifier = NSTouchBar.CustomizationIdentifier("UsageTouchBar.default")
-        touchBar.principalItemIdentifier = Self.detailIdentifier
+        touchBar.principalItemIdentifier = Self.summaryIdentifier
     }
 
     private func configurePopover() {
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 380, height: 240)
+        popover.contentSize = NSSize(width: UsageViewController.popoverWidth, height: 240)
         popover.contentViewController = UsageViewController(store: store)
     }
 
@@ -1097,11 +1356,19 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 12
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
+        row.spacing = 10
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 12)
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        // Provider name (+ plan) at the left.
+        // Real brand icon at the far left.
+        let icon = NSImageView(image: ProviderBranding.icon(for: selectedProvider, size: 18))
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        row.addArrangedSubview(icon)
+
+        // Provider name (+ plan) next to the icon.
         let title = NSStackView()
         title.orientation = .vertical
         title.alignment = .leading
@@ -1133,11 +1400,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             row.addArrangedSubview(label(message, color: .systemOrange, bold: false, size: 11))
         }
 
-        // Wrap in a rounded card that fills the strip height.
+        // Wrap in a rounded card that fills the strip height, with a subtle
+        // provider-accent left border for at-a-glance identification.
         let container = NSView()
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor(white: 0.16, alpha: 1).cgColor
-        container.layer?.cornerRadius = 6
+        container.layer?.backgroundColor = NSColor(white: 0.17, alpha: 1).cgColor
+        container.layer?.cornerRadius = 7
+        container.layer?.borderWidth = 1
+        container.layer?.borderColor = selectedProvider.accentColor.withAlphaComponent(0.35).cgColor
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(row)
 
@@ -1150,6 +1420,53 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         ])
 
         return container
+    }
+
+    private func makeSummaryView() -> NSView {
+        let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        for provider in [Provider.codex, Provider.claude] {
+            row.addArrangedSubview(summaryButton(provider: provider, snapshot: snapshots[provider]))
+        }
+
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor(white: 0.15, alpha: 1).cgColor
+        container.layer?.cornerRadius = 6
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(row)
+
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(equalToConstant: 30),
+            container.widthAnchor.constraint(equalToConstant: 330),
+            row.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            row.topAnchor.constraint(equalTo: container.topAnchor),
+            row.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+
+        return container
+    }
+
+    private func summaryButton(provider: Provider, snapshot: UsageSnapshot?) -> NSButton {
+        let button = NSButton(title: "", target: self, action: #selector(providerButtonPressed(_:)))
+        button.image = makeExpandedProviderImage(provider: provider, snapshot: snapshot)
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
+        button.isBordered = false
+        button.toolTip = provider.rawValue
+        button.identifier = NSUserInterfaceItemIdentifier(provider.rawValue)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 153).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return button
     }
 
     private func bar(caption: String, percent: Double?, trailing: String) -> UsageBarView {
@@ -1171,10 +1488,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
     private func refreshTouchBar() {
         refreshAuthState()
+        summaryItem?.view = makeSummaryView()
         detailItem?.view = makeDetailView()
-        controlStripButton?.attributedTitle = controlStripTitle()
-        touchBar.defaultItemIdentifiers = [Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
-        statusItem.button?.title = statusTitle()
+        if let controlStripButton {
+            controlStripButton.image = makeControlStripTriggerImage()
+            controlStripButton.needsDisplay = true
+        }
+        touchBar.defaultItemIdentifiers = [Self.summaryIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
+        statusItem?.button?.title = statusTitle()
         (popover.contentViewController as? UsageViewController)?.reload()
     }
 
@@ -1197,13 +1518,19 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
               let provider = Provider(rawValue: raw) else {
             return
         }
+        selectProvider(provider)
+        showLoginIfNeeded()
+    }
 
+    /// Switches the expanded detail tile to `provider` and re-renders the
+    /// provider logo buttons so the selection is reflected in both places.
+    private func selectProvider(_ provider: Provider) {
         selectedProvider = provider
         codexButton?.image = makeLogoImage(provider: .codex, selected: selectedProvider == .codex)
         claudeButton?.image = makeLogoImage(provider: .claude, selected: selectedProvider == .claude)
+        summaryItem?.view = makeSummaryView()
         detailItem?.view = makeDetailView()
-        touchBar.defaultItemIdentifiers = [Self.codexIdentifier, Self.claudeIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
-        showLoginIfNeeded()
+        touchBar.defaultItemIdentifiers = [Self.summaryIdentifier, Self.detailIdentifier, Self.refreshIdentifier]
     }
 
     private func installControlStripItem() {
@@ -1214,62 +1541,311 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             return
         }
 
-        let item = NSCustomTouchBarItem(identifier: Self.controlStripIdentifier)
-        let button = NSButton(title: "", target: self, action: #selector(controlStripTapped))
-        button.isBordered = false
-        button.imagePosition = .noImage
-        button.attributedTitle = controlStripTitle()
+        let providers: [Provider]
+        let itemIdentifier: NSTouchBarItem.Identifier
+        if let ownedProvider {
+            providers = [ownedProvider]
+            itemIdentifier = Self.controlStripIdentifier(for: ownedProvider)
+        } else {
+            removeLegacyControlStripItems()
+            providers = [.codex, .claude]
+            itemIdentifier = Self.controlStripIdentifier
+        }
+
+        let item = NSCustomTouchBarItem(identifier: itemIdentifier)
+        let button = makeControlStripButton(for: providers)
         item.view = button
 
         controlStripItem = item
         controlStripButton = button
         ControlStrip.add(item)
-    }
-
-    /// Compact, always-visible summary shown directly in the Control Strip, e.g.
-    /// `CX 19%  CL 35%`, with each provider tinted by its accent and usage color.
-    private func controlStripTitle() -> NSAttributedString {
-        let snapshots = store.currentSnapshots()
-        let result = NSMutableAttributedString()
-        guard !snapshots.isEmpty else {
-            return NSAttributedString(
-                string: "Usage",
-                attributes: [
-                    .foregroundColor: NSColor.labelColor,
-                    .font: NSFont.systemFont(ofSize: 13, weight: .medium)
-                ]
-            )
-        }
-
-        for (index, snapshot) in snapshots.enumerated() {
-            if index > 0 {
-                result.append(NSAttributedString(string: "  "))
+        if ownedProvider == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                ControlStrip.presentModal(self.touchBar, trayIdentifier: Self.controlStripIdentifier)
             }
-            result.append(NSAttributedString(
-                string: snapshot.provider.symbol + " ",
-                attributes: [
-                    .foregroundColor: snapshot.provider.accentColor,
-                    .font: NSFont.systemFont(ofSize: 13, weight: .semibold)
-                ]
-            ))
-            let text = snapshot.error == nil ? UsageFormat.percentText(snapshot.dailyPercent) : "–"
-            let color = snapshot.error == nil
-                ? UsageFormat.color(forPercent: snapshot.dailyPercent ?? 0)
-                : NSColor.systemGray
-            result.append(NSAttributedString(
-                string: text,
-                attributes: [
-                    .foregroundColor: color,
-                    .font: NSFont.systemFont(ofSize: 13, weight: .medium)
-                ]
-            ))
         }
-        return result
     }
 
-    @objc private func controlStripTapped() {
-        // Tap the always-on summary to expand the full usage bar over the strip.
-        ControlStrip.presentModal(touchBar, trayIdentifier: Self.controlStripIdentifier)
+    private func removeLegacyControlStripItems() {
+        for provider in Provider.allCases {
+            let legacyItem = NSCustomTouchBarItem(identifier: Self.controlStripIdentifier(for: provider))
+            ControlStrip.remove(legacyItem)
+        }
+    }
+
+    private func makeControlStripButton(for providers: [Provider]) -> ControlStripSummaryButton {
+        let button = ControlStripSummaryButton(title: "", target: self, action: #selector(controlStripTriggerPressed(_:)))
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.image = providers.count > 1 ? makeControlStripTriggerImage() : makeControlStripImage(for: providers)
+        button.toolTip = providers.map(\.rawValue).joined(separator: " / ")
+        button.providers = providers
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: providers.count > 1 ? 32 : 59).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return button
+    }
+
+    /// Bundle identifiers / fallback app paths for the providers' desktop apps,
+    /// used to source their real brand icons.
+    private func appIcon(for provider: Provider) -> NSImage? {
+        ProviderBranding.appIcon(for: provider)
+    }
+
+    /// Compact usage number tinted green/orange/red by how full the limit is.
+    private func controlStripNumber(for provider: Provider) -> NSAttributedString {
+        let snapshot = store.currentSnapshots().first { $0.provider == provider }
+        let text: String
+        let color: NSColor
+        if let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent {
+            text = "\(min(99, Int(percent.rounded())))"
+            color = UsageFormat.color(forPercent: percent)
+        } else {
+            text = "–"
+            color = .systemGray
+        }
+        return NSAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: color,
+                .font: NSFont.systemFont(ofSize: 17, weight: .bold)
+            ]
+        )
+    }
+
+    private func makeControlStripTriggerImage() -> NSImage {
+        let size = NSSize(width: 24, height: 24)
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(size.width * scale),
+            pixelsHigh: Int(size.height * scale),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return NSImage(size: size)
+        }
+        rep.size = size
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+
+        let iconRect = NSRect(x: 1, y: 1, width: 22, height: 22)
+        NSColor(white: 0.14, alpha: 1).setFill()
+        let background = NSBezierPath(roundedRect: iconRect, xRadius: 6, yRadius: 6)
+        background.fill()
+
+        // Two mini vertical gauges — one per provider — that fill from the
+        // bottom by real 5-hour usage and take on the usage color, so the
+        // always-visible Control Strip glyph reflects live state at a glance.
+        let snapshots = Dictionary(uniqueKeysWithValues: store.currentSnapshots().map { ($0.provider, $0) })
+        let slots: [(provider: Provider, x: CGFloat)] = [(.codex, 5), (.claude, 13)]
+        let trackY: CGFloat = 5
+        let trackHeight: CGFloat = 14
+        let barWidth: CGFloat = 6
+        for slot in slots {
+            let track = NSBezierPath(
+                roundedRect: NSRect(x: slot.x, y: trackY, width: barWidth, height: trackHeight),
+                xRadius: 2, yRadius: 2
+            )
+            NSColor(white: 0.32, alpha: 1).setFill()
+            track.fill()
+
+            let snapshot = snapshots[slot.provider]
+            guard let snapshot, snapshot.error == nil, let percent = snapshot.dailyPercent else { continue }
+            let clamped = max(0, min(100, percent))
+            let fillHeight = max(2, trackHeight * CGFloat(clamped / 100))
+            let fill = NSBezierPath(
+                roundedRect: NSRect(x: slot.x, y: trackY, width: barWidth, height: fillHeight),
+                xRadius: 2, yRadius: 2
+            )
+            UsageFormat.color(forPercent: clamped).setFill()
+            fill.fill()
+        }
+
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = NSImage(size: size)
+        image.addRepresentation(rep)
+        image.isTemplate = false
+        return image
+    }
+
+    private func makeExpandedProviderImage(provider: Provider, snapshot: UsageSnapshot?) -> NSImage {
+        let width: CGFloat = 153
+        let height: CGFloat = 24
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(width * scale),
+            pixelsHigh: Int(height * scale),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return NSImage(size: NSSize(width: width, height: height))
+        }
+        rep.size = NSSize(width: width, height: height)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+
+        let iconSide: CGFloat = 22
+        let icon = appIcon(for: provider) ?? makeLogoImage(provider: provider, selected: provider == selectedProvider)
+        icon.draw(
+            in: NSRect(x: 1, y: (height - iconSide) / 2, width: iconSide, height: iconSide),
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1
+        )
+
+        let nameAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: provider.accentColor,
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
+        ]
+        let hasUsage = snapshot != nil && snapshot?.error == nil
+        let dailyPercent = hasUsage ? snapshot?.dailyPercent : nil
+        let usageColor: NSColor = hasUsage
+            ? UsageFormat.color(forPercent: dailyPercent ?? 0)
+            : .systemGray
+        let usageText = hasUsage ? UsageFormat.percentText(dailyPercent) : "–"
+
+        let usageAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: usageColor,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 15, weight: .bold)
+        ]
+        let weekAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        ]
+
+        let textX: CGFloat = 27
+
+        // Top line: provider name (left) + large 5-hour percentage (right).
+        let name = provider.rawValue as NSString
+        name.draw(at: NSPoint(x: textX, y: 12), withAttributes: nameAttrs)
+
+        let usage = usageText as NSString
+        let usageSize = usage.size(withAttributes: usageAttrs)
+        usage.draw(at: NSPoint(x: width - usageSize.width - 2, y: 9), withAttributes: usageAttrs)
+
+        // Bottom line: a thin 5-hour usage bar + weekly percentage on the right.
+        let weeklyText = "W \(UsageFormat.percentText(hasUsage ? snapshot?.weeklyPercent : nil))" as NSString
+        let weeklySize = weeklyText.size(withAttributes: weekAttrs)
+        weeklyText.draw(at: NSPoint(x: width - weeklySize.width - 2, y: 1), withAttributes: weekAttrs)
+
+        let barX = textX
+        let barMaxX = width - weeklySize.width - 8
+        let barWidth = barMaxX - barX
+        if barWidth > 6 {
+            let barHeight: CGFloat = 4
+            let barY: CGFloat = 3
+            let trackRect = NSRect(x: barX, y: barY, width: barWidth, height: barHeight)
+            NSColor(white: 0.32, alpha: 1).setFill()
+            NSBezierPath(roundedRect: trackRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+
+            if let dailyPercent {
+                let clamped = max(0, min(100, dailyPercent))
+                let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
+                let fillRect = NSRect(x: barX, y: barY, width: fillWidth, height: barHeight)
+                usageColor.setFill()
+                NSBezierPath(roundedRect: fillRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+            }
+        }
+
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.addRepresentation(rep)
+        image.isTemplate = false
+        return image
+    }
+
+    /// Draws a provider as `[app icon] 13%` into a crisp 2× bitmap.
+    /// Uses the real Anthropic / OpenAI app icon, falling back to the `CL`/`CX`
+    /// badge if the desktop app isn't installed.
+    private func makeControlStripImage(for providers: [Provider]) -> NSImage {
+        let iconSize: CGFloat = 24
+        let iconGap: CGFloat = 2
+        let providerGap: CGFloat = 5
+
+        let segments = providers.map { provider in
+            let number = controlStripNumber(for: provider)
+            let icon = appIcon(for: provider) ?? makeLogoImage(provider: provider, selected: true)
+            return (icon: icon, number: number, textSize: number.size())
+        }
+
+        let contentWidth = segments.enumerated().reduce(CGFloat(0)) { total, pair in
+            let separator = pair.offset == 0 ? CGFloat(0) : providerGap
+            return total + separator + iconSize + iconGap + ceil(pair.element.textSize.width)
+        }
+        let maxTextHeight = segments.map { ceil($0.textSize.height) }.max() ?? 1
+        let width = max(1, contentWidth)
+        let height = max(1, max(iconSize, maxTextHeight))
+
+        // Render into a 2× bitmap so the Touch Bar (a Retina surface) shows it
+        // sharp rather than upscaling a 1× image into a fuzzy, smaller-looking blob.
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(width * scale),
+            pixelsHigh: Int(height * scale),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return NSImage(size: NSSize(width: width, height: height))
+        }
+        rep.size = NSSize(width: width, height: height)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        var x: CGFloat = 0
+        for (index, segment) in segments.enumerated() {
+            if index > 0 { x += providerGap }
+            segment.icon.draw(
+                in: NSRect(x: x, y: (height - iconSize) / 2, width: iconSize, height: iconSize),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1
+            )
+            x += iconSize + iconGap
+            segment.number.draw(at: NSPoint(x: x, y: (height - segment.textSize.height) / 2))
+            x += ceil(segment.textSize.width)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.addRepresentation(rep)
+        image.isTemplate = false
+        return image
+    }
+
+    @objc private func controlStripTriggerPressed(_ sender: ControlStripSummaryButton) {
+        controlStripTapped()
+    }
+
+    private func controlStripTapped() {
+        if let ownedProvider {
+            selectProvider(ownedProvider)
+        }
+        let trayIdentifier = ownedProvider.map { Self.controlStripIdentifier(for: $0) } ?? Self.controlStripIdentifier
+        ControlStrip.presentModal(touchBar, trayIdentifier: trayIdentifier)
     }
 
     private func teardownControlStripItem() {
@@ -1322,7 +1898,7 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     @objc private func togglePopover() {
-        guard let button = statusItem.button else { return }
+        guard let button = statusItem?.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
@@ -1334,6 +1910,9 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
 @MainActor
 final class UsageViewController: NSViewController {
+    static let popoverWidth: CGFloat = 380
+    static let cardWidth: CGFloat = popoverWidth - 32
+
     private let store: UsageStore
     private let stack = NSStackView()
     private let formatter: RelativeDateTimeFormatter = {
@@ -1352,10 +1931,10 @@ final class UsageViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 190))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: Self.popoverWidth, height: 200))
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
 
@@ -1378,72 +1957,159 @@ final class UsageViewController: NSViewController {
             $0.removeFromSuperview()
         }
 
-        let title = NSTextField(labelWithString: "Usage Touch Bar")
-        title.font = .boldSystemFont(ofSize: 16)
-        stack.addArrangedSubview(title)
+        stack.addArrangedSubview(header())
 
         let snapshots = store.currentSnapshots()
         if snapshots.isEmpty {
-            stack.addArrangedSubview(NSTextField(labelWithString: "Loading provider usage..."))
-            return
+            let loading = NSTextField(labelWithString: "Loading provider usage…")
+            loading.font = .systemFont(ofSize: 12)
+            loading.textColor = .secondaryLabelColor
+            stack.addArrangedSubview(loading)
+        } else {
+            for snapshot in snapshots {
+                stack.addArrangedSubview(card(for: snapshot))
+            }
         }
 
-        for snapshot in snapshots {
-            stack.addArrangedSubview(row(for: snapshot))
-        }
+        // Size the popover to fit its content.
+        view.layoutSubtreeIfNeeded()
+        let height = stack.fittingSize.height + 32
+        preferredContentSize = NSSize(width: Self.popoverWidth, height: height)
     }
 
-    private func row(for snapshot: UsageSnapshot) -> NSView {
+    private func header() -> NSView {
         let container = NSStackView()
         container.orientation = .vertical
         container.alignment = .leading
-        container.spacing = 4
+        container.spacing = 2
 
-        let titleRow = NSStackView()
-        titleRow.orientation = .horizontal
-        titleRow.alignment = .firstBaseline
-        titleRow.spacing = 6
+        let title = NSTextField(labelWithString: "Usage")
+        title.font = .systemFont(ofSize: 16, weight: .bold)
+        container.addArrangedSubview(title)
 
-        let headline = NSTextField(labelWithString: snapshot.provider.rawValue)
-        headline.font = .boldSystemFont(ofSize: 14)
-        headline.textColor = snapshot.error == nil ? .labelColor : .systemOrange
-        titleRow.addArrangedSubview(headline)
+        let subtitle = NSTextField(labelWithString: "Claude Code & Codex limits")
+        subtitle.font = .systemFont(ofSize: 11)
+        subtitle.textColor = .secondaryLabelColor
+        container.addArrangedSubview(subtitle)
 
-        if let plan = snapshot.planLabel {
-            let planLabel = NSTextField(labelWithString: plan)
-            planLabel.font = .systemFont(ofSize: 11)
-            planLabel.textColor = .tertiaryLabelColor
-            titleRow.addArrangedSubview(planLabel)
+        return container
+    }
+
+    private func card(for snapshot: UsageSnapshot) -> NSView {
+        let innerWidth = Self.cardWidth - 24
+
+        let box = NSBox()
+        box.boxType = .custom
+        box.titlePosition = .noTitle
+        box.cornerRadius = 10
+        box.borderWidth = 1
+        box.borderColor = .separatorColor
+        box.fillColor = .clear
+        box.translatesAutoresizingMaskIntoConstraints = false
+        box.widthAnchor.constraint(equalToConstant: Self.cardWidth).isActive = true
+
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 8
+        content.translatesAutoresizingMaskIntoConstraints = false
+        box.contentView?.addSubview(content)
+        if let host = box.contentView {
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 12),
+                content.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -12),
+                content.topAnchor.constraint(equalTo: host.topAnchor, constant: 10),
+                content.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10)
+            ])
         }
-        container.addArrangedSubview(titleRow)
+
+        content.addArrangedSubview(headerRow(for: snapshot, width: innerWidth))
 
         if let error = snapshot.error {
             let errorLabel = NSTextField(wrappingLabelWithString: error)
             errorLabel.font = .systemFont(ofSize: 12)
             errorLabel.textColor = .systemOrange
-            container.addArrangedSubview(errorLabel)
+            errorLabel.preferredMaxLayoutWidth = innerWidth
+            content.addArrangedSubview(errorLabel)
         } else {
-            let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
-            let daily = NSTextField(labelWithString:
-                "5-hour window: \(UsageFormat.percentText(snapshot.dailyPercent))  ·  resets in \(reset)")
-            daily.font = .systemFont(ofSize: 12)
-            daily.textColor = .labelColor
-            container.addArrangedSubview(daily)
+            content.addArrangedSubview(limitBar(caption: "5-hour", percent: snapshot.dailyPercent, width: innerWidth))
+            content.addArrangedSubview(limitBar(caption: "Weekly", percent: snapshot.weeklyPercent, width: innerWidth))
 
-            let weekly = NSTextField(labelWithString:
-                "Weekly: \(UsageFormat.percentText(snapshot.weeklyPercent))  ·  \(UsageFormat.tokenText(snapshot.totalTokens)) tokens")
-            weekly.font = .systemFont(ofSize: 12)
-            weekly.textColor = .secondaryLabelColor
-            container.addArrangedSubview(weekly)
-
-            let updated = formatter.localizedString(for: snapshot.updatedAt, relativeTo: Date())
-            let updatedLabel = NSTextField(labelWithString: "updated \(updated)")
-            updatedLabel.font = .systemFont(ofSize: 10)
-            updatedLabel.textColor = .tertiaryLabelColor
-            container.addArrangedSubview(updatedLabel)
+            let meta = NSTextField(labelWithString: metaText(for: snapshot))
+            meta.font = .systemFont(ofSize: 10)
+            meta.textColor = .tertiaryLabelColor
+            meta.lineBreakMode = .byTruncatingTail
+            content.addArrangedSubview(meta)
         }
 
-        return container
+        return box
+    }
+
+    private func headerRow(for snapshot: UsageSnapshot, width: CGFloat) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
+
+        let icon = NSImageView(image: ProviderBranding.icon(for: snapshot.provider, size: 20))
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        row.addArrangedSubview(icon)
+
+        let name = NSTextField(labelWithString: snapshot.provider.rawValue)
+        name.font = .systemFont(ofSize: 14, weight: .semibold)
+        name.textColor = snapshot.error == nil ? .labelColor : .systemOrange
+        row.addArrangedSubview(name)
+
+        if let plan = snapshot.planLabel {
+            let planLabel = NSTextField(labelWithString: plan.uppercased())
+            planLabel.font = .systemFont(ofSize: 9, weight: .semibold)
+            planLabel.textColor = .tertiaryLabelColor
+            row.addArrangedSubview(planLabel)
+        }
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
+
+        let dotColor: NSColor
+        if snapshot.error != nil {
+            dotColor = .systemGray
+        } else {
+            dotColor = UsageFormat.color(forPercent: snapshot.dailyPercent ?? snapshot.weeklyPercent ?? 0)
+        }
+        let dot = StatusDotView(color: dotColor)
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        row.addArrangedSubview(dot)
+
+        return row
+    }
+
+    private func limitBar(caption: String, percent: Double?, width: CGFloat) -> NSView {
+        let bar = PopoverLimitBar(caption: caption, percent: percent)
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.widthAnchor.constraint(equalToConstant: width).isActive = true
+        bar.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        return bar
+    }
+
+    private func metaText(for snapshot: UsageSnapshot) -> String {
+        var parts: [String] = []
+        if let tokens = snapshot.totalTokens, tokens > 0 {
+            parts.append("\(UsageFormat.tokenText(tokens)) tokens")
+        }
+        let reset = UsageFormat.resetText(snapshot.dailyResetAt ?? snapshot.weeklyResetAt)
+        if reset != "—" {
+            parts.append("resets in \(reset)")
+        }
+        parts.append("updated \(formatter.localizedString(for: snapshot.updatedAt, relativeTo: Date()))")
+        return parts.joined(separator: "  ·  ")
     }
 }
 
@@ -1452,12 +2118,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controller: TouchBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let collectors: [UsageCollecting] = [
-            ClaudeUsageCollector(),
-            CodexUsageCollector()
-        ]
+        // `--agent <provider>` runs a single-provider agent that owns one Control
+        // Strip slot. With no flag we are the launcher: menu bar + one combined
+        // Control Strip item containing Codex and Claude buttons side by side.
+        let args = CommandLine.arguments
+        let agentProvider = args.firstIndex(of: "--agent")
+            .flatMap { args.indices.contains($0 + 1) ? Provider(rawValue: args[$0 + 1]) : nil }
 
-        let controller = TouchBarController(store: UsageStore(collectors: collectors))
+        let mode: TouchBarController.Mode = agentProvider.map { .agent($0) } ?? .launcher
+
+        // An agent only needs its own provider's collector (keeps it light and
+        // avoids touching the other provider's credentials).
+        let collectors: [UsageCollecting]
+        switch mode {
+        case .agent(.claude): collectors = [ClaudeUsageCollector()]
+        case .agent(.codex): collectors = [CodexUsageCollector()]
+        case .launcher: collectors = [ClaudeUsageCollector(), CodexUsageCollector()]
+        }
+
+        // An agent reparented to launchd (ppid == 1) means the launcher died —
+        // quit so the slot doesn't linger.
+        if mode != .launcher {
+            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+                if getppid() == 1 { Task { @MainActor in NSApp.terminate(nil) } }
+            }
+        }
+
+        let controller = TouchBarController(store: UsageStore(collectors: collectors), mode: mode)
         self.controller = controller
         controller.start()
     }

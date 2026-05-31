@@ -51,13 +51,31 @@ If the menu bar item appears but the Touch Bar does not change, choose **Focus T
 
 ## Touch Bar pinning
 
-The app presents its Touch Bar UI by default when the app is active, makes the selected-provider details the principal Touch Bar item, and opens a small focus host panel on launch. The Touch Bar shape is:
+On macOS versions that expose the private Control Strip API, the app pins one
+always-visible item in the Control Strip showing both providers as
+`[app icon] %` pairs (using the real Anthropic and OpenAI/Codex app icons):
 
 ```text
-[Codex] [Claude]  Codex : 5 hrs usage : 39%
-                  Reset : 21:07
-                  Weekly usage : 40%
+ 34%   39%
 ```
+
+It is a single slot because macOS only surfaces one app item in the collapsed
+Control Strip — a second item stays hidden behind the `<` expander — and it
+hard-caps an item's width, clipping wide *text* titles (so the label is drawn as
+a scalable image instead). Tapping the summary expands the full usage bar over
+the strip, which has per-provider Codex/Claude buttons and the detail tile:
+
+```text
+[Codex] [Claude]  Claude  5h ▓▓▓░ 39%  Wk ▓░ 12%  ↻ 2h   [Refresh]
+```
+
+macOS controls where system-tray items sit in the Control Strip, so the exact
+position (relative to the emoji/Siri keys) is chosen by the OS and can't be
+pinned by the app.
+
+When the Control Strip API is unavailable, the app presents its Touch Bar UI
+while active, makes the selected-provider details the principal item, and opens
+a small focus host panel on launch.
 
 macOS does not allow third-party apps to silently pin themselves into the system Control Strip by default. To keep it globally available, pin it manually:
 
