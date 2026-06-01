@@ -297,7 +297,8 @@ enum CLI {
     static func daemonPID() -> (pid: pid_t, message: String?) {
         let path = daemonPIDPath
         guard FileManager.default.fileExists(atPath: path) else {
-            return (0, "No daemon is running (PID file missing)")
+            // Normal first-launch case — no PID file yet, nothing to warn about.
+            return (0, nil)
         }
         guard let content = try? String(contentsOfFile: path, encoding: .utf8),
               let pid = pid_t(content.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -342,18 +343,13 @@ enum CLI {
         try? FileManager.default.removeItem(atPath: daemonPIDPath)
     }
 
-    /// Forks the current process: the parent exits immediately (the terminal
-    /// gets its prompt back), and the child calls `execve(...)` to replace
-    /// itself with a fresh `usage-touchbar` invocation that runs
-    /// `watch --touchbar --interval <interval>` in the foreground (which
-    /// the entry point routes to the `--touchbar` AppKit path). The child
-    /// writes its PID before the exec so `stop` can find it later.
+    /// Spawns a **daemonized** child process that survives terminal closure.
+    /// Uses `posix_spawn` with `POSIX_SPAWN_SETSID` so the child gets its own
+    /// session and process group — closing the terminal won't kill it.
     ///
-    /// This is intentionally a `fork` + `exec` rather than `posix_spawn`
-    /// or `NSProcess` because the child needs the same environment
-    /// (Xcode toolchain, PATH, SwiftPM runtime) that the user built or
-    /// installed with. `exec`ing the exact binary path preserves all of
-    /// that.
+    /// The child inherits the window-server connection from the parent, so
+    /// AppKit works, but we redirect stdin/stdout/stderr to /dev/null so the
+    /// parent can exit immediately.
     static func startDaemon(interval: Int) {
         let (existingPID, msg) = daemonPID()
         if existingPID > 0 {
@@ -365,59 +361,74 @@ enum CLI {
             print("warning: \(msg) — starting fresh daemon.")
         }
 
-        // Resolve the binary we are currently running as. For a release
-        // install this is /opt/homebrew/bin/usage-touchbar; for a debug
-        // build it's .build/debug/usage-touchbar. We pass `--no-fork` to
-        // the child so it runs the watch loop directly instead of forking
-        // again (which would be infinite).
+        // Resolve the binary we are currently running as.
         var pathBuffer = [Int8](repeating: 0, count: Int(PATH_MAX))
         _ = pathBuffer.withUnsafeMutableBufferPointer { buf in
             proc_pidpath(getpid(), buf.baseAddress, UInt32(buf.count))
         }
         let binaryPath = String(cString: pathBuffer)
 
-        let childPID = fork()
-        if childPID < 0 {
-            FileHandle.standardError.write(
-                Data("fork failed: \(String(cString: strerror(errno)))\n".utf8)
-            )
+        // Build a C-style argv: [binaryPath, "watch", "--touchbar", "--interval", "N", nil]
+        let cArgs: [String] = [
+            binaryPath,
+            "watch", "--touchbar",
+            "--interval", "\(interval)"
+        ]
+
+        var pid: pid_t = 0
+        let ret: Int32 = cArgs.withUnsafeBufferPointer { argsBuf -> Int32 in
+            // Convert String args to C strings
+            let cStrings: [UnsafeMutablePointer<CChar>] = argsBuf.map { strdup($0) }
+            defer { cStrings.forEach { free($0) } }
+
+            // Build the argv array with a nil terminator
+            var argv = cStrings.map(UnsafeMutablePointer<CChar>?.init)
+            argv.append(nil)
+
+            var attrs: posix_spawnattr_t?
+            posix_spawnattr_init(&attrs)
+            // SETSID: child gets its own session — survives terminal closure.
+            // CLOEXEC_DEFAULT: all file descriptors except stdin/out/err are
+            // closed on exec.
+            posix_spawnattr_setflags(&attrs, Int16(
+                POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT
+            ))
+
+            var fileActions: posix_spawn_file_actions_t?
+            posix_spawn_file_actions_init(&fileActions)
+            // Redirect stdin to /dev/null and stdout/stderr to a log file so
+            // the parent can exit but we can still diagnose the detached
+            // daemon if AppKit / the Touch Bar fails to come up.
+            let logPath = DataFiles.expand("~/.config/usage-touchbar/daemon.log")
+            let logDir = (logPath as NSString).deletingLastPathComponent
+            try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+            posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO,  "/dev/null", O_RDONLY, 0)
+            posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, logPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, logPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+
+            let r = posix_spawn(&pid, binaryPath, &fileActions, &attrs, argv, nil)
+            posix_spawn_file_actions_destroy(&fileActions)
+            posix_spawnattr_destroy(&attrs)
+            return r
+        }
+
+        if ret != 0 {
+            print("Failed to start daemon: \(String(cString: strerror(ret)))")
             return
         }
 
-        if childPID == 0 {
-            // Child: close stdin/stdout/stderr so it's totally detached.
-            // (We keep the Touch Bar connection which is via Mach ports,
-            // not file descriptors.)
-            close(STDIN_FILENO)
-            close(STDOUT_FILENO)
-            close(STDERR_FILENO)
-
-            // exec into a fresh instance of ourselves with `--no-fork` so
-            // the child process runs the AppKit loop directly. The `--`
-            // ensures flags are not interpreted as SwiftPM args.
-            let args = [
-                binaryPath,
-                "watch", "--touchbar",
-                "--interval", "\(interval)",
-                "--no-fork"
-            ]
-            let argv = args.map { strdup($0) }
-            // execvp searches PATH; execv uses absolute path.
-            execv(binaryPath, argv)
-            // If we get here, exec failed.
-            _exit(1)
-        }
-
-        // Parent: write the PID, print confirmation, exit.
-        writeDaemonPID(childPID)
-        print("usage-touchbar daemon started (PID \(childPID)).")
-        print("  The Touch Bar is now live — you can close this terminal.")
-        print("  Stop it with: usage-touchbar stop")
+        writeDaemonPID(pid)
+        print("✅ Touch Bar is now live and showing usage (PID \(pid)).")
+        print("   This terminal is free — keep using it for other commands.")
+        print("   The Touch Bar stays live until you run: usage-touchbar stop")
     }
 
-    /// Sends SIGINT to the daemon (if running) and removes the PID file.
-    /// The daemon's `stopRequested` flag flips, the AppKit run loop exits,
-    /// and the Control Strip item uninstalls. Clean exit every time.
+    /// Sends SIGTERM to the daemon (if running) and removes the PID file.
+    /// SIGTERM is used instead of SIGINT because the AppKit-based daemon
+    /// runs inside `NSApplication.run()` which does not reliably process
+    /// SIGINT via dispatch sources; SIGTERM delivers a clean process
+    /// termination that AppKit handles via its `applicationWillTerminate`
+    /// delegate callback.
     static func stopDaemon() {
         let (pid, msg) = daemonPID()
         guard pid > 0 else {
@@ -425,7 +436,7 @@ enum CLI {
             return
         }
         print("Stopping daemon (PID \(pid))…")
-        if kill(pid, SIGINT) != 0 {
+        if kill(pid, SIGTERM) != 0 {
             let err = String(cString: strerror(errno))
             print("warning: could not signal daemon: \(err)")
         }

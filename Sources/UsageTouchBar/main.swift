@@ -3565,6 +3565,7 @@ if shouldRunCLI(effective) {
             await CLI.run(effective)
             exit(0)
         }
+
         app.run()
         exit(0)
     }

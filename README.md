@@ -46,8 +46,16 @@ brew install neelashkannan/tap/usage-touchbar
 That puts `usage-touchbar` on your `PATH`. From any terminal:
 
 ```bash
-# Start the Touch Bar accessory + silent live refresh loop. Press ^C to exit.
-usage-touchbar --touchbar
+# Start the Touch Bar daemon in the background. The terminal is
+# immediately free to use for other commands — the Touch Bar stays
+# live until you run `stop`.
+usage-touchbar --touchbar          # same as `usage-touchbar start`
+
+# Stop the background daemon.
+usage-touchbar stop
+
+# Start with a custom refresh interval (seconds).
+usage-touchbar start --interval 10
 
 # One-shot status print (no Touch Bar, no TUI).
 usage-touchbar status
@@ -142,7 +150,15 @@ publish exact limits, so tune them to your plan.
 
 ## Quitting
 
-There is no menu bar, so quit with:
+If you started the Touch Bar with `usage-touchbar --touchbar` (or `start`),
+just run:
+
+```bash
+usage-touchbar stop
+```
+
+For the LaunchAgent / permanent-resident mode (Option B), there is no menu bar,
+so quit with:
 
 ```bash
 pkill -x usage-touchbar
