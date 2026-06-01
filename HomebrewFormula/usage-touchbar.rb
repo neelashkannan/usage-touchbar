@@ -1,14 +1,15 @@
 class UsageTouchbar < Formula
-  desc "Real-time Claude Code, Codex, and OpenCode usage limits on the macOS Touch Bar and CLI"
+  desc "Claude Code, Codex, and OpenCode usage limits on the Touch Bar and CLI"
   homepage "https://github.com/neelashkannan/usage-touchbar"
-  url "https://github.com/neelashkannan/usage-touchbar/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "REPLACE_WITH_SHA256_OF_RELEASE_TARBALL"
+  url "https://github.com/neelashkannan/usage-touchbar/archive/refs/tags/v1.1.0.tar.gz"
+  sha256 "735728da45f5e72b9679983fabed626cb66e525018bbab4a9445b89c2e790e1b"
   license "MIT"
+
+  depends_on xcode: ["16.0", :build]
 
   # Built against the macOS 13 SDK; older releases will not have the Swift
   # Concurrency / NSTouchBar APIs this project depends on.
-  depends_on :macos => :ventura
-  depends_on xcode: ["16.0", :build]
+  depends_on macos: :ventura
 
   # Universal build is required because the bundled `scripts/build-and-sign.sh`
   # produces an arm64 + x86_64 fat Mach-O so the same binary runs on both
@@ -31,7 +32,9 @@ class UsageTouchbar < Formula
     # `.build/release` for any future change to the build script.
     release_bin = Pathname(".build/apple/Products/Release/usage-touchbar")
     release_bin = Pathname(".build/release/usage-touchbar") unless release_bin.exist?
+
     raise "Could not locate the built binary" unless release_bin.exist?
+
     bin.install release_bin => "usage-touchbar"
 
     # Install the README so `brew info usage-touchbar` shows the
@@ -40,10 +43,11 @@ class UsageTouchbar < Formula
   end
 
   test do
-    # `usage-touchbar help` exits 0 and prints the usage text. We pipe
-    # through `head -1` so the test does not depend on the entire help
-    # block being byte-for-byte stable.
-    assert_match "usage-touchbar", shell_output("#{bin}/usage-touchbar help", 0)
-    assert_match "Claude, Codex & OpenCode", shell_output("#{bin}/usage-touchbar help", 0)
+    # `usage-touchbar help` exits 0 and prints the usage text. We only
+    # assert on substrings so the test does not depend on the entire
+    # help block being byte-for-byte stable.
+    help = shell_output("#{bin}/usage-touchbar help")
+    assert_match "usage-touchbar", help
+    assert_match "Claude, Codex & OpenCode", help
   end
 end
