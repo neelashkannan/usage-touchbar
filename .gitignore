@@ -21,3 +21,9 @@ COPILOT.md
 
 # Built app bundle (produced by scripts/build-and-sign.sh)
 UsageTouchBar.app/
+
+# Distributable disk images: ignore the dist/ folder's loose artifacts but keep
+# the shippable .dmg under version control so it's available from the repo.
+dist/*
+!dist/
+!dist/*.dmg

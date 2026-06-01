@@ -11,11 +11,29 @@
 #   get prompted again. Signing every build with the same identity gives the app
 #   a stable identity, so "Always Allow" sticks permanently.
 #
+# The binary is built as a UNIVERSAL (fat) Mach-O containing both arm64 and
+# x86_64 slices, so the same UsageTouchBar.app runs on Apple Silicon (M-series
+# 13" MacBook Pro with Touch Bar) AND Intel Macs (2016-2019 MacBook Pro with
+# Touch Bar).
+#
 # Usage:
-#   ./scripts/build-and-sign.sh            # release build, signed
-#   ./scripts/build-and-sign.sh --run      # build, sign, then launch
+#   ./scripts/build-and-sign.sh            # universal release build, signed, installed
+#   ./scripts/build-and-sign.sh --run      # …and (re)launch it
+#   ./scripts/build-and-sign.sh --dmg      # …and also produce a distributable .dmg
+#
+# Flags can be combined, e.g. `./scripts/build-and-sign.sh --run --dmg`.
 #
 set -euo pipefail
+
+WANT_RUN=0
+WANT_DMG=0
+for arg in "$@"; do
+    case "$arg" in
+        --run) WANT_RUN=1 ;;
+        --dmg) WANT_DMG=1 ;;
+        *) echo "Unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
 
 IDENTITY_NAME="UsageTouchBar Local Signing"
 BUNDLE_ID="com.neelashkannan.usage-touchbar"
@@ -52,11 +70,17 @@ if ! security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -F 
     echo "  done."
 fi
 
-# 2. Build a release binary.
-echo "› Building release…"
-swift build -c release
+# 2. Build a UNIVERSAL release binary (arm64 + x86_64) so one app runs on both
+#    Apple Silicon and Intel Touch Bar Macs.
+echo "› Building universal release (arm64 + x86_64)…"
+swift build -c release --arch arm64 --arch x86_64
 
-BINARY="$ROOT/.build/release/usage-touchbar"
+BINARY="$ROOT/.build/apple/Products/Release/usage-touchbar"
+if [[ ! -f "$BINARY" ]]; then
+    echo "Universal binary not found at $BINARY" >&2
+    exit 1
+fi
+echo "  architectures: $(lipo -archs "$BINARY")"
 
 # 3. Resolve the stable signing identity.
 IDENTITY_SHA1="$(
@@ -140,6 +164,31 @@ echo "  with the stable signature it will not ask again."
 echo "  Arrange/hide providers from the gear on the expanded Touch Bar,"
 echo "  or in ~/.config/usage-touchbar/config.json"
 
-if [[ "${1:-}" == "--run" ]]; then
+# 9. Optionally package a distributable disk image. The DMG contains the signed
+#    universal app plus an /Applications symlink so anyone can drag-to-install
+#    on either Intel or Apple Silicon Touch Bar Macs.
+if [[ "$WANT_DMG" == "1" ]]; then
+    VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo "1.0.0")"
+    DIST_DIR="$ROOT/dist"
+    DMG_PATH="$DIST_DIR/UsageTouchBar-$VERSION.dmg"
+    STAGING="$(mktemp -d)"
+    trap 'rm -rf "$STAGING"' EXIT
+
+    echo "› Packaging DMG…"
+    mkdir -p "$DIST_DIR"
+    cp -R "$APP" "$STAGING/UsageTouchBar.app"
+    ln -s /Applications "$STAGING/Applications"
+    rm -f "$DMG_PATH"
+    hdiutil create \
+        -volname "Usage Touch Bar" \
+        -srcfolder "$STAGING" \
+        -ov -format UDZO \
+        "$DMG_PATH" >/dev/null
+    # Sign the disk image itself with the same stable identity.
+    codesign --force --sign "$IDENTITY_SHA1" "$DMG_PATH" >/dev/null 2>&1 || true
+    echo "✓ Disk image ready: $DMG_PATH"
+fi
+
+if [[ "$WANT_RUN" == "1" ]]; then
     echo "› Already launched by launchd (KeepAlive)."
 fi

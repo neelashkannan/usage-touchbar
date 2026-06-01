@@ -336,8 +336,11 @@ struct CodexUsageCollector: UsageCollecting {
 
         var best: (date: Date, event: TokenCountPayload)?
 
-        // The most recently modified rollout holds the freshest account-wide
-        // rate limits; scan a few in case the newest has no token_count yet.
+        // Account-wide rate limits are global, but a freshly created/resumed
+        // rollout can carry OLDER telemetry than another recent session. Scan
+        // every recent file and keep the globally newest `token_count` event so
+        // the Touch Bar always reflects the latest API response, never a stale
+        // file that merely happens to have the newest modification time.
         for file in files {
             DataFiles.forEachLine(in: file) { line in
                 guard line.contains("\"token_count\"") else { return }
@@ -350,7 +353,6 @@ struct CodexUsageCollector: UsageCollecting {
                     best = (date, payload)
                 }
             }
-            if best != nil { break }
         }
 
         guard let result = best, let limits = result.event.rate_limits else {

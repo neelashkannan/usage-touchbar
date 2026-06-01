@@ -4,34 +4,80 @@ Real-time **Claude Code, Codex, and OpenCode** usage limits in the macOS Touch
 Bar Control Strip — one single background app, no Dock icon, **no menu-bar
 icon**.
 
+Ships as a **universal binary**, so the same app runs on both **Apple Silicon
+(M-series)** and **Intel** Touch Bar MacBook Pros.
+
 ## What it shows
 
 An always-visible Control Strip glyph with a mini gauge per provider. Tap it to
 expand the full Touch Bar with each provider's 5-hour and weekly usage, reset
-countdowns, and a refresh button.
+countdowns, and a refresh button. Data auto-refreshes every 20 seconds.
 
 - **Claude** — live limits from Claude Code's `/usage` endpoint (falls back to a
   local estimate from `~/.claude/projects` when offline).
-- **Codex** — rate limits from `~/.codex/sessions` rollout telemetry.
+- **Codex** — real rate limits + token telemetry read from
+  `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`. The collector scans the recent
+  rollouts and always shows the globally newest `token_count` event, so a freshly
+  created or resumed session never masks fresher usage data.
 - **OpenCode** — token usage estimated from `~/.local/share/opencode` storage.
 
 Providers you aren't signed into simply show `–`.
 
-## Build, sign & install
+## Requirements
+
+- A Mac **with a Touch Bar**:
+  - **Apple Silicon** — M1/M2 13" MacBook Pro (2020 / 2022).
+  - **Intel** — MacBook Pro with Touch Bar (2017–2019; 2016 models are limited to
+    macOS 12 and below).
+- **macOS 13 (Ventura) or newer.**
+- **Swift 6 toolchain** (Xcode 16+) to build from source.
+
+The release build is a universal (`arm64` + `x86_64`) Mach-O — no separate Intel
+download is needed.
+
+## Install
+
+### Option A — drag-to-install from the DMG
 
 ```bash
-./scripts/build-and-sign.sh          # release build → signed → installed to ~/Applications
+./scripts/build-and-sign.sh --dmg
+```
+
+This produces `dist/UsageTouchBar-<version>.dmg`. Open it and drag
+**UsageTouchBar.app** onto the **Applications** shortcut. The same disk image
+installs on both Intel and Apple Silicon Macs.
+
+### Option B — build, sign & install in place
+
+```bash
+./scripts/build-and-sign.sh          # universal build → signed → installed to ~/Applications
 ./scripts/build-and-sign.sh --run    # …and launch it
 ```
 
-This builds **one** app bundle (`UsageTouchBar.app`), signs it with a stable
-self-signed identity, strips the quarantine flag, and installs it to
-`~/Applications`.
+Flags can be combined, e.g. `./scripts/build-and-sign.sh --run --dmg`.
+
+The script:
+
+1. Builds **one universal app bundle** (`UsageTouchBar.app`) containing both
+   `arm64` and `x86_64` slices.
+2. Signs it with a stable, self-signed identity (created once, reused after).
+3. Strips the quarantine flag so Gatekeeper doesn't nag.
+4. Installs it to `~/Applications` (user space → no admin password).
+5. Installs/refreshes a LaunchAgent so exactly one instance runs and relaunches
+   at login.
+6. With `--dmg`, also packages a signed, distributable disk image into `dist/`.
+
+You can confirm the architectures of the installed app at any time:
+
+```bash
+lipo -archs ~/Applications/UsageTouchBar.app/Contents/MacOS/usage-touchbar
+# → x86_64 arm64
+```
 
 ### About the password prompt
 
 The app reads Claude's OAuth token. To minimize the macOS "allow access" prompt
-it now reads `~/.claude/.credentials.json` **first** (no Keychain, no prompt) and
+it reads `~/.claude/.credentials.json` **first** (no Keychain, no prompt) and
 only falls back to the Keychain when that file is absent. Because the app is one
 bundle signed with a stable identity, clicking **"Always Allow"** once makes the
 grant stick across rebuilds — you should not be asked again.
@@ -56,7 +102,8 @@ Create `~/.config/usage-touchbar/config.json` to arrange the providers:
 - **Order** — the array order is the left-to-right Touch Bar order.
 - **Show / hide** — set `"enabled": false` (or drop the entry) to exclude a
   provider. Omit the whole `providers` array to show all three.
-- Changes take effect on the next launch.
+- Changes take effect on the next launch (or via the gear on the expanded Touch
+  Bar).
 
 The Claude budgets are only used for the offline estimate; Anthropic does not
 publish exact limits, so tune them to your plan.
@@ -69,7 +116,8 @@ There is no menu bar, so quit with:
 pkill -x usage-touchbar
 ```
 
-## Requirements
+To stop it relaunching at login, also unload the LaunchAgent:
 
-- macOS 13+ with a Touch Bar
-- Swift 6 toolchain
+```bash
+launchctl unload ~/Library/LaunchAgents/com.neelashkannan.usage-touchbar.plist
+```
