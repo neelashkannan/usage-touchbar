@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Security
+import SQLite3
 
 /// A structured, reale-data snapshot of a provider's usage.
 ///
@@ -259,6 +260,81 @@ enum DataFiles {
         return matches.sorted { $0.1 > $1.1 }.map { $0.0 }
     }
 
+    /// Returns the newest files under a date-partitioned tree of the form
+    /// `<directory>/<Y>/<M>/<D>/...`, sorted newest first.
+    ///
+    /// Unlike `recentFiles`, this never relies on full-tree enumeration order
+    /// or an inspection cap, so it keeps working no matter how many historical
+    /// sessions have accumulated. It descends into the most recent date folders
+    /// (year → month → day, each sorted descending) and stops as soon as it has
+    /// gathered at least `limit` files, then returns them ordered by modification
+    /// time. This guarantees the currently-active session is always seen.
+    static func recentDatePartitionedFiles(
+        in directory: String,
+        extensions: Set<String>,
+        limit: Int
+    ) -> [URL] {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: directory, isDirectory: &isDir), isDir.boolValue else {
+            return []
+        }
+
+        // Lists immediate subdirectories whose names sort numerically descending
+        // (newest first). Non-numeric names fall back to lexicographic order.
+        func subdirectoriesDescending(_ url: URL) -> [URL] {
+            let contents = (try? fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return contents
+                .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+                .sorted { a, b in
+                    if let na = Int(a.lastPathComponent), let nb = Int(b.lastPathComponent) {
+                        return na > nb
+                    }
+                    return a.lastPathComponent > b.lastPathComponent
+                }
+        }
+
+        func files(in url: URL) -> [(URL, Date)] {
+            let contents = (try? fm.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return contents.compactMap { file in
+                guard extensions.contains(file.pathExtension.lowercased()) else { return nil }
+                let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+                guard values?.isRegularFile == true else { return nil }
+                return (file, values?.contentModificationDate ?? .distantPast)
+            }
+        }
+
+        var matches: [(URL, Date)] = []
+        let root = URL(fileURLWithPath: directory)
+        // Walk year → month → day, newest first, collecting day-folder files until
+        // we have comfortably more than `limit` (so mtime sorting is meaningful).
+        for year in subdirectoriesDescending(root) {
+            for month in subdirectoriesDescending(year) {
+                for day in subdirectoriesDescending(month) {
+                    matches.append(contentsOf: files(in: day))
+                    if matches.count >= limit { break }
+                }
+                if matches.count >= limit { break }
+            }
+            if matches.count >= limit { break }
+        }
+
+        // Fallback: some files may live directly under the root (non-partitioned).
+        if matches.isEmpty {
+            matches.append(contentsOf: files(in: root))
+        }
+
+        return matches.sorted { $0.1 > $1.1 }.map { $0.0 }
+    }
+
     /// Streams a file line by line without loading the whole file into memory.
     static func forEachLine(in url: URL, _ body: (String) -> Void) {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return }
@@ -283,6 +359,24 @@ enum DataFiles {
         if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8), !line.isEmpty {
             body(line)
         }
+    }
+
+    /// Returns complete lines near the end of a file, newest first.
+    static func recentLines(in url: URL, maxBytes: UInt64 = 1024 * 1024) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+
+        let size = (try? handle.seekToEnd()) ?? 0
+        guard size > 0 else { return [] }
+
+        let bytesToRead = min(size, maxBytes)
+        try? handle.seek(toOffset: size - bytesToRead)
+        let data = handle.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        let completeLines = bytesToRead < size ? lines.dropFirst() : lines[...]
+        return completeLines.reversed().map(String.init)
     }
 }
 
@@ -319,13 +413,205 @@ struct CodexUsageCollector: UsageCollecting {
         let payload: TokenCountPayload?
     }
 
+    static func newestSessionFile() -> URL? {
+        sessionFiles(limit: 1).first
+    }
+
+    private static func sessionFiles(limit: Int) -> [URL] {
+        let sessionsDir = DataFiles.expand("~/.codex/sessions")
+        return Array(DataFiles.recentDatePartitionedFiles(
+            in: sessionsDir,
+            extensions: ["jsonl"],
+            limit: limit
+        ).prefix(limit))
+    }
+
+    /// Endpoint that returns the same account-wide rate-limit data that
+    /// `/status` renders inside the Codex TUI, but accessible without spawning
+    /// an interactive Codex session. Reaches the real-time numbers the
+    /// rollout-file scanner cannot see when no Codex turn is actively writing
+    /// `token_count` events.
+    private static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
+
+    /// In-memory cache of the last successful live-API response. The endpoint
+    /// sits on the same backend the Codex CLI uses, so polling it on every
+    /// 20-second tick would burn through the user's network budget and risk
+    /// being throttled. We refresh at most once per `liveMinInterval` and
+    /// serve the cached live data in between, mirroring the Claude collector.
+    private static let liveCacheLock = NSLock()
+    private nonisolated(unsafe) static var liveCache: UsageSnapshot?
+    private nonisolated(unsafe) static var liveCacheAt: Date?
+    private static let liveMinInterval: TimeInterval = 30
+
+    private static func freshLiveSnapshot() -> UsageSnapshot? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        guard let snapshot = liveCache, let at = liveCacheAt,
+              Date().timeIntervalSince(at) < liveMinInterval else { return nil }
+        return snapshot
+    }
+
+    private static func lastLiveSnapshot() -> UsageSnapshot? {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        return liveCache
+    }
+
+    private static func storeLiveSnapshot(_ snapshot: UsageSnapshot) {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveCache = snapshot
+        liveCacheAt = Date()
+    }
+
+    private struct Auth: Decodable {
+        let tokens: Tokens
+        struct Tokens: Decodable {
+            let access_token: String
+            let account_id: String?
+        }
+    }
+
+    /// Reads the ChatGPT access token + account id Codex already wrote to
+    /// `~/.codex/auth.json`. Returns `nil` if the file is missing/malformed
+    /// or the user signed in with an API key (no account_id).
+    private static func loadAuth() -> Auth? {
+        let path = DataFiles.expand("~/.codex/auth.json")
+        guard let data = FileManager.default.contents(atPath: path),
+              let auth = try? JSONDecoder().decode(Auth.self, from: data),
+              !auth.tokens.access_token.isEmpty else { return nil }
+        return auth
+    }
+
     func collect() async -> UsageSnapshot {
         guard AuthDetector.current().isConnected(.codex) else {
             return .disconnected(.codex)
         }
 
-        let sessionsDir = DataFiles.expand("~/.codex/sessions")
-        let files = DataFiles.recentFiles(in: sessionsDir, extensions: ["jsonl"]).prefix(12)
+        // Live API first: returns real-time data even when no Codex turn is
+        // actively writing `token_count` events to a rollout file. Cached for
+        // 30s to keep request volume low.
+        if let cached = Self.freshLiveSnapshot() { return cached }
+        if let live = await Self.fetchLiveSnapshotShared() {
+            Self.storeLiveSnapshot(live)
+            return live
+        }
+        // Network failed: keep showing the last good live data instead of
+        // dropping to the file-based estimate, so the numbers stay accurate.
+        if let stale = Self.lastLiveSnapshot() { return stale }
+
+        return collectFromRollouts()
+    }
+
+    /// Single shared in-flight request, so a 20s tick, a watcher fire, and a
+    /// manual refresh don't all hammer `wham/usage` at the same instant.
+    /// `Task` is a value type, so we stash a reference-typed `Token` in the
+    /// box and compare by pointer identity when we want to clear "our" task.
+    private final class InflightBox: @unchecked Sendable {
+        fileprivate final class Token {}
+        private let lock = NSLock()
+        private var currentToken: Token?
+        private var currentTask: Task<UsageSnapshot?, Never>?
+
+        /// Returns a tuple of the in-flight task and a token that identifies
+        /// "the task I just started/joined". Callers pass the token back to
+        /// `clear(_:)` to clear the slot only if it still points at that same
+        /// task (avoids racing with a fresh request that already replaced it).
+        fileprivate func startOrJoin(_ factory: @escaping @Sendable () async -> UsageSnapshot?) -> (Task<UsageSnapshot?, Never>, Token) {
+            lock.lock()
+            if let existing = currentTask, let existingToken = currentToken {
+                lock.unlock()
+                return (existing, existingToken)
+            }
+            let token = Token()
+            let new = Task { await factory() }
+            currentToken = token
+            currentTask = new
+            lock.unlock()
+            return (new, token)
+        }
+
+        fileprivate func clear(_ token: Token) {
+            lock.lock()
+            if currentToken === token {
+                currentToken = nil
+                currentTask = nil
+            }
+            lock.unlock()
+        }
+    }
+    private static let inflightBox = InflightBox()
+
+    private static func fetchLiveSnapshotShared() async -> UsageSnapshot? {
+        let (task, token) = inflightBox.startOrJoin { await fetchLiveSnapshot() }
+        let result = await task.value
+        inflightBox.clear(token)
+        return result
+    }
+
+    private struct APIWindow: Decodable {
+        let used_percent: Double?
+        let reset_at: Double?
+        let limit_window_seconds: Double?
+    }
+    private struct APIRateLimit: Decodable {
+        let allowed: Bool?
+        let limit_reached: Bool?
+        let primary_window: APIWindow?
+        let secondary_window: APIWindow?
+    }
+    private struct APIUsage: Decodable {
+        let plan_type: String?
+        let rate_limit: APIRateLimit?
+    }
+
+    private static func fetchLiveSnapshot() async -> UsageSnapshot? {
+        guard let auth = loadAuth() else { return nil }
+
+        var request = URLRequest(url: usageURL)
+        request.timeoutInterval = 6
+        // Always hit the network — a cached GET would freeze the numbers and
+        // make refreshes look like they do nothing.
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("Bearer \(auth.tokens.access_token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let accountID = auth.tokens.account_id, !accountID.isEmpty {
+            request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+        request.setValue("usage-touchbar/1.0", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let usage = try? JSONDecoder().decode(APIUsage.self, from: data),
+              let rate = usage.rate_limit else {
+            return nil
+        }
+
+        // Empty payload (the user might be on a plan this endpoint doesn't
+        // cover, or hit it before the first window has started).
+        guard rate.primary_window?.used_percent != nil || rate.secondary_window?.used_percent != nil else {
+            return nil
+        }
+
+        return UsageSnapshot(
+            provider: .codex,
+            isConnected: true,
+            dailyPercent: rate.primary_window?.used_percent,
+            weeklyPercent: rate.secondary_window?.used_percent,
+            dailyResetAt: rate.primary_window?.reset_at.map { Date(timeIntervalSince1970: $0) },
+            weeklyResetAt: rate.secondary_window?.reset_at.map { Date(timeIntervalSince1970: $0) },
+            totalTokens: nil,
+            planLabel: usage.plan_type.map { $0.capitalized },
+            updatedAt: Date(),
+            error: nil
+        )
+    }
+
+    /// JSONL-rollout fallback used when the live API is unreachable (offline,
+    /// token expired, endpoint returns non-200). Kept identical to the
+    /// pre-API behavior so the Touch Bar still shows *something* during outages.
+    private func collectFromRollouts() -> UsageSnapshot {
+        let files = Self.sessionFiles(limit: 24)
         guard !files.isEmpty else {
             return .failure(.codex, message: "No Codex sessions found")
         }
@@ -336,21 +622,36 @@ struct CodexUsageCollector: UsageCollecting {
 
         var best: (date: Date, event: TokenCountPayload)?
 
+        func consider(_ line: String) -> Bool {
+            guard line.contains("\"token_count\"") else { return false }
+            guard let data = line.data(using: .utf8),
+                  let event = try? decoder.decode(Event.self, from: data),
+                  let payload = event.payload, payload.type == "token_count",
+                  payload.rate_limits != nil else { return false }
+            let date = event.timestamp.flatMap { isoFormatter.date(from: $0) } ?? Date.distantPast
+            if best == nil || date > best!.date {
+                best = (date, payload)
+            }
+            return true
+        }
+
         // Account-wide rate limits are global, but a freshly created/resumed
         // rollout can carry OLDER telemetry than another recent session. Scan
         // every recent file and keep the globally newest `token_count` event so
         // the Touch Bar always reflects the latest API response, never a stale
         // file that merely happens to have the newest modification time.
         for file in files {
-            DataFiles.forEachLine(in: file) { line in
-                guard line.contains("\"token_count\"") else { return }
-                guard let data = line.data(using: .utf8),
-                      let event = try? decoder.decode(Event.self, from: data),
-                      let payload = event.payload, payload.type == "token_count",
-                      payload.rate_limits != nil else { return }
-                let date = event.timestamp.flatMap { isoFormatter.date(from: $0) } ?? Date.distantPast
-                if best == nil || date > best!.date {
-                    best = (date, payload)
+            for line in DataFiles.recentLines(in: file) {
+                if consider(line) { break }
+            }
+        }
+
+        // Very old/large files can have sparse telemetry. If the fast tail path
+        // finds nothing, fall back to a full scan of the newest few files.
+        if best == nil {
+            for file in files.prefix(3) {
+                DataFiles.forEachLine(in: file) { line in
+                    _ = consider(line)
                 }
             }
         }
@@ -768,14 +1069,19 @@ struct ClaudeUsageCollector: UsageCollecting {
     }
 }
 
-/// Reads OpenCode usage from its local session storage.
+/// Reads OpenCode usage from its local SQLite store.
 ///
-/// OpenCode (sst/opencode) stores per-message records as JSON under
-/// `~/.local/share/opencode/storage/message/**` (with `tokens` + `time`
-/// fields). We sum token throughput over the rolling 5-hour and weekly windows
-/// and express it as a percentage of a budget, mirroring the Claude estimate.
-/// The reader is deliberately tolerant of schema drift and degrades to a clear
-/// message when no telemetry is found.
+/// OpenCode (sst/opencode) keeps a Drizzle-managed SQLite database at
+/// `~/.local/share/opencode/opencode.db`. Per-message records live in the
+/// `message` table with a JSON `data` column that carries `tokens.input`,
+/// `tokens.output`, `tokens.reasoning`, and `tokens.cache.{read,write}` plus
+/// a `time.created` / `time.completed` epoch in milliseconds.
+///
+/// We sum token throughput over the rolling 5-hour and weekly windows and
+/// express it as a percentage of a budget, mirroring the Claude estimate.
+/// The reader opens the database read-only, so it never interferes with
+/// OpenCode's own writes, and degrades to a clear message when no telemetry
+/// is found.
 struct OpenCodeUsageCollector: UsageCollecting {
     let provider: Provider = .opencode
 
@@ -783,107 +1089,183 @@ struct OpenCodeUsageCollector: UsageCollecting {
     private let fiveHourTokenBudget = 90_000_000
     private let weeklyTokenBudget = 440_000_000
 
-    private var dataRoots: [String] {
+    private var dbPaths: [String] {
         [
-            "~/.local/share/opencode",
-            "~/.config/opencode",
-            "~/Library/Application Support/opencode"
+            "~/.local/share/opencode/opencode.db",
+            "~/.config/opencode/opencode.db",
+            "~/Library/Application Support/opencode/opencode.db"
         ]
     }
 
-    private struct Tokens: Decodable {
-        let input: Int?
-        let output: Int?
-        struct Cache: Decodable { let read: Int?; let write: Int? }
-        let cache: Cache?
-
-        var total: Int {
-            (input ?? 0) + (output ?? 0) + (cache?.read ?? 0) + (cache?.write ?? 0)
+    /// The newest file that can be watched to know OpenCode just produced new
+    /// data. We prefer the Write-Ahead Log because every committed transaction
+    /// in WAL mode touches it; we fall back to the main DB file when WAL mode
+    /// is disabled. Returning `nil` simply means "no watcher available", the
+    /// 20-second poll still keeps the snapshot fresh.
+    static func watchableDBPath() -> String? {
+        for path in pathsToWatch() where FileManager.default.fileExists(atPath: path) {
+            return path
         }
+        return nil
     }
-    private struct Time: Decodable { let created: Double?; let completed: Double? }
-    private struct Record: Decodable {
-        let tokens: Tokens?
-        let time: Time?
+
+    private static func pathsToWatch() -> [String] {
+        let walPaths = [
+            "~/.local/share/opencode/opencode.db-wal",
+            "~/.config/opencode/opencode.db-wal",
+            "~/Library/Application Support/opencode/opencode.db-wal"
+        ]
+        let mainPaths = [
+            "~/.local/share/opencode/opencode.db",
+            "~/.config/opencode/opencode.db",
+            "~/Library/Application Support/opencode/opencode.db"
+        ]
+        return walPaths + mainPaths
+    }
+
+    private struct WindowTotals {
+        var input = 0
+        var output = 0
+        var reasoning = 0
+        var cacheRead = 0
+        var cacheWrite = 0
+        var oldest: Date?
+        var latest: Date?
+
+        var total: Int { input + output + reasoning + cacheRead + cacheWrite }
     }
 
     func collect() async -> UsageSnapshot {
         guard AuthDetector.current().isConnected(.opencode) else {
             return .disconnected(.opencode)
         }
-        guard let root = dataRoots
+        guard let dbPath = dbPaths
             .map({ DataFiles.expand($0) })
             .first(where: { FileManager.default.fileExists(atPath: $0) }) else {
             return .failure(.opencode, message: "OpenCode data not found")
         }
 
-        let now = Date()
-        let weekAgo = now.addingTimeInterval(-7 * 24 * 3600)
-        let fiveHoursAgo = now.addingTimeInterval(-5 * 3600)
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let fiveHourCutoff = nowMs - 5 * 3600 * 1000
+        let weekCutoff = nowMs - 7 * 24 * 3600 * 1000
 
-        let files = DataFiles.recentFiles(in: root, extensions: ["json", "jsonl"], modifiedAfter: weekAgo)
-        guard !files.isEmpty else {
-            return .failure(.opencode, message: "No usage in the last 7 days")
+        let fiveHour: WindowTotals
+        let weekly: WindowTotals
+        do {
+            (fiveHour, weekly) = try Self.queryUsage(dbPath: dbPath, fiveHourCutoffMs: fiveHourCutoff, weekCutoffMs: weekCutoff)
+        } catch {
+            return .failure(.opencode, message: "OpenCode DB unreadable")
         }
 
-        let decoder = JSONDecoder()
-        var fiveHourTokens = 0
-        var weeklyTokens = 0
-        var oldestFiveHour: Date?
-        var oldestWeekly: Date?
-        var latest = Date.distantPast
-
-        func consume(_ record: Record) {
-            guard let tokens = record.tokens?.total, tokens > 0 else { return }
-            // OpenCode timestamps are epoch milliseconds.
-            let epochMs = record.time?.completed ?? record.time?.created
-            guard let epochMs else { return }
-            let date = Date(timeIntervalSince1970: epochMs / 1000)
-            if date >= weekAgo {
-                weeklyTokens += tokens
-                latest = max(latest, date)
-                if oldestWeekly == nil || date < oldestWeekly! { oldestWeekly = date }
-            }
-            if date >= fiveHoursAgo {
-                fiveHourTokens += tokens
-                if oldestFiveHour == nil || date < oldestFiveHour! { oldestFiveHour = date }
-            }
-        }
-
-        for file in files {
-            if file.pathExtension == "jsonl" {
-                DataFiles.forEachLine(in: file) { line in
-                    guard line.contains("\"tokens\""),
-                          let data = line.data(using: .utf8),
-                          let record = try? decoder.decode(Record.self, from: data) else { return }
-                    consume(record)
-                }
-            } else if let data = try? Data(contentsOf: file),
-                      let record = try? decoder.decode(Record.self, from: data) {
-                consume(record)
-            }
-        }
-
-        guard weeklyTokens > 0 else {
+        guard weekly.total > 0 else {
             return .failure(.opencode, message: "No usage telemetry yet")
         }
 
-        let dailyPercent = min(100, Double(fiveHourTokens) / Double(fiveHourTokenBudget) * 100)
-        let weeklyPercent = min(100, Double(weeklyTokens) / Double(weeklyTokenBudget) * 100)
+        let dailyPercent = min(100, Double(fiveHour.total) / Double(fiveHourTokenBudget) * 100)
+        let weeklyPercent = min(100, Double(weekly.total) / Double(weeklyTokenBudget) * 100)
 
         return UsageSnapshot(
             provider: .opencode,
             isConnected: true,
             dailyPercent: dailyPercent,
             weeklyPercent: weeklyPercent,
-            dailyResetAt: oldestFiveHour?.addingTimeInterval(5 * 3600),
-            weeklyResetAt: oldestWeekly?.addingTimeInterval(7 * 24 * 3600),
-            totalTokens: weeklyTokens,
+            dailyResetAt: fiveHour.oldest.map { $0.addingTimeInterval(5 * 3600) },
+            weeklyResetAt: weekly.oldest.map { $0.addingTimeInterval(7 * 24 * 3600) },
+            totalTokens: weekly.total,
             planLabel: "est.",
-            updatedAt: latest == .distantPast ? now : latest,
+            updatedAt: weekly.latest ?? Date(),
             error: nil
         )
     }
+
+    /// Opens the DB read-only, runs a single query that returns both windows
+    /// in one pass, and returns the per-window totals. Uses the `message`
+    /// table's `time_created` column (indexed) for the cutoff, then pulls
+    /// `tokens.{input,output,reasoning,cache.read,cache.write}` out of the
+    /// JSON `data` column for each matching assistant message.
+    private static func queryUsage(
+        dbPath: String,
+        fiveHourCutoffMs: Int64,
+        weekCutoffMs: Int64
+    ) throws -> (WindowTotals, WindowTotals) {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
+        guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK, let db else {
+            throw OpenCodeDBError.openFailed
+        }
+        defer { sqlite3_close_v2(db) }
+
+        // One scan: a single CASE expression buckets each row into 5h or
+        // weekly, so SQLite still reads the table once even when both
+        // windows overlap. We deliberately don't use JSON1's -> operator
+        // form so this also works if a future build ships without the
+        // extension (the function form is part of the core).
+        let sql = """
+        SELECT
+            COALESCE(SUM(CASE WHEN time_created >= ?1 THEN json_extract(data, '$.tokens.input')      END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?1 THEN json_extract(data, '$.tokens.output')     END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?1 THEN json_extract(data, '$.tokens.reasoning')  END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?1 THEN json_extract(data, '$.tokens.cache.read')  END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?1 THEN json_extract(data, '$.tokens.cache.write') END), 0),
+            MIN(CASE WHEN time_created >= ?1 THEN time_created END),
+            MAX(CASE WHEN time_created >= ?1 THEN time_created END),
+
+            COALESCE(SUM(CASE WHEN time_created >= ?2 THEN json_extract(data, '$.tokens.input')      END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?2 THEN json_extract(data, '$.tokens.output')     END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?2 THEN json_extract(data, '$.tokens.reasoning')  END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?2 THEN json_extract(data, '$.tokens.cache.read')  END), 0),
+            COALESCE(SUM(CASE WHEN time_created >= ?2 THEN json_extract(data, '$.tokens.cache.write') END), 0),
+            MIN(CASE WHEN time_created >= ?2 THEN time_created END),
+            MAX(CASE WHEN time_created >= ?2 THEN time_created END)
+        FROM message
+        WHERE time_created >= ?2
+          AND json_extract(data, '$.tokens') IS NOT NULL
+        """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            throw OpenCodeDBError.queryFailed
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, fiveHourCutoffMs)
+        sqlite3_bind_int64(stmt, 2, weekCutoffMs)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            throw OpenCodeDBError.queryFailed
+        }
+
+        var five = WindowTotals()
+        five.input = Int(sqlite3_column_int64(stmt, 0))
+        five.output = Int(sqlite3_column_int64(stmt, 1))
+        five.reasoning = Int(sqlite3_column_int64(stmt, 2))
+        five.cacheRead = Int(sqlite3_column_int64(stmt, 3))
+        five.cacheWrite = Int(sqlite3_column_int64(stmt, 4))
+        five.oldest = Self.date(fromColumn: stmt, index: 5)
+        five.latest = Self.date(fromColumn: stmt, index: 6)
+
+        var week = WindowTotals()
+        week.input = Int(sqlite3_column_int64(stmt, 7))
+        week.output = Int(sqlite3_column_int64(stmt, 8))
+        week.reasoning = Int(sqlite3_column_int64(stmt, 9))
+        week.cacheRead = Int(sqlite3_column_int64(stmt, 10))
+        week.cacheWrite = Int(sqlite3_column_int64(stmt, 11))
+        week.oldest = Self.date(fromColumn: stmt, index: 12)
+        week.latest = Self.date(fromColumn: stmt, index: 13)
+
+        return (five, week)
+    }
+
+    private static func date(fromColumn stmt: OpaquePointer?, index: Int32) -> Date? {
+        guard let stmt else { return nil }
+        if sqlite3_column_type(stmt, index) == SQLITE_NULL { return nil }
+        return Date(timeIntervalSince1970: Double(sqlite3_column_int64(stmt, index)) / 1000)
+    }
+}
+
+private enum OpenCodeDBError: Error {
+    case openFailed
+    case queryFailed
 }
 
 @MainActor
@@ -1519,6 +1901,130 @@ final class VerticalSeparatorView: NSView {
     }
 }
 
+/// A compact two-bar gauge for one provider. Both progress bars run
+/// horizontally and are stacked vertically inside the same 30pt-tall slot:
+///
+/// ```
+/// 5h ▓▓▓▓▓░░░░░ 19%  ↻ 2h 14m
+/// Wk ▓▓░░░░░░░░░  3%
+/// ```
+///
+/// The 5-hour row keeps the reset countdown **inline** (right of the percent)
+/// so the user sees when the limit refills without giving the slot a second
+/// line. The weekly row underneath just shows the bar and its percent.
+/// Width was tuned so the Touch Bar detail strip fits two providers plus the
+/// codex/claude logos comfortably on a 13" MacBook Pro.
+final class StackedUsageBarView: NSView {
+    private let primary: UsageBar
+    private let secondary: UsageBar
+
+    private struct UsageBar {
+        let caption: String
+        let percent: Double?
+        let trailing: String
+        let reset: String?
+    }
+
+    init(primaryPercent: Double?, primaryTrailing: String, primaryReset: String?,
+         secondaryPercent: Double?, secondaryTrailing: String) {
+        self.primary = UsageBar(caption: "5h", percent: primaryPercent,
+                                trailing: primaryTrailing, reset: primaryReset)
+        self.secondary = UsageBar(caption: "Wk", percent: secondaryPercent,
+                                  trailing: secondaryTrailing, reset: nil)
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Narrow enough that two providers plus their icon+name still fit on a
+    /// 13" Touch Bar with breathing room, but wide enough that the bar track
+    /// itself never collapses below ~70pt.
+    override var intrinsicContentSize: NSSize { NSSize(width: 130, height: 30) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        // Two equal rows inside a 30pt slot, with a 1pt gap between them so
+        // the fill colors of the two bars don't visually bleed together.
+        let rowHeight = (bounds.height - 1) / 2
+        let primaryRect = NSRect(x: 0, y: rowHeight + 1, width: bounds.width, height: rowHeight)
+        let secondaryRect = NSRect(x: 0, y: 0, width: bounds.width, height: rowHeight)
+        drawBar(primary, in: primaryRect, drawReset: true)
+        drawBar(secondary, in: secondaryRect, drawReset: false)
+    }
+
+    private func drawBar(_ bar: UsageBar, in row: NSRect, drawReset: Bool) {
+        let captionAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: NSColor.tertiaryLabelColor
+        ]
+        let valueAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let resetAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 7.5, weight: .regular),
+            .foregroundColor: NSColor.tertiaryLabelColor.withAlphaComponent(0.7)
+        ]
+
+        let midY = row.midY
+
+        let captionSize = bar.caption.size(withAttributes: captionAttrs)
+        bar.caption.draw(at: NSPoint(x: 0, y: midY - captionSize.height / 2),
+                         withAttributes: captionAttrs)
+
+        let valueSize = bar.trailing.size(withAttributes: valueAttrs)
+        bar.trailing.draw(
+            at: NSPoint(x: row.maxX - valueSize.width, y: midY - valueSize.height / 2),
+            withAttributes: valueAttrs
+        )
+
+        // Reserve room on the right for the inline reset text, when present,
+        // so the bar track never underflows into the percent label.
+        let reserved: CGFloat
+        if drawReset, let reset = bar.reset, !reset.isEmpty {
+            let resetText = "↻ \(reset)" as NSString
+            let resetSize = resetText.size(withAttributes: resetAttrs)
+            let resetX = row.maxX - valueSize.width - resetSize.width - 4
+            // Keep the reset visible only if the row is wide enough — on a
+            // really narrow slot (future smaller Touch Bar?), the bar track
+            // wins and the reset gets dropped silently.
+            if resetX > 20 {
+                resetText.draw(at: NSPoint(x: resetX, y: midY - resetSize.height / 2),
+                               withAttributes: resetAttrs)
+                reserved = row.maxX - resetX + 2
+            } else {
+                reserved = valueSize.width + 5
+            }
+        } else {
+            reserved = valueSize.width + 5
+        }
+
+        let barX = captionSize.width + 5
+        let barWidth = row.maxX - reserved - barX
+        if barWidth > 6 {
+            let barHeight: CGFloat = 3
+            let trackRect = NSRect(x: barX, y: midY - barHeight / 2,
+                                   width: barWidth, height: barHeight)
+            NSColor(white: 1, alpha: 0.14).setFill()
+            NSBezierPath(roundedRect: trackRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+            if let percent = bar.percent {
+                let clamped = max(0, min(100, percent))
+                let fillWidth = max(barHeight, barWidth * CGFloat(clamped / 100))
+                let fillRect = NSRect(x: barX, y: midY - barHeight / 2,
+                                      width: fillWidth, height: barHeight)
+                let fillPath = NSBezierPath(roundedRect: fillRect,
+                                            xRadius: barHeight / 2, yRadius: barHeight / 2)
+                UsageFormat.color(forPercent: clamped).setFill()
+                fillPath.fill()
+            }
+        }
+    }
+}
+
 @MainActor
 final class ControlStripSummaryButton: NSButton {
     var providers: [Provider] = []
@@ -1670,6 +2176,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     private var selectedProvider: Provider = .codex
     private var authState = AuthDetector.current()
     private var timer: Timer?
+    private var codexWatcher: DispatchSourceFileSystemObject?
+    private var watchedCodexSessionPath: String?
+    private var watchedCodexInode: UInt64 = 0
+    private var watchedCodexMTime: Date = .distantPast
+    private var openCodeWatcher: DispatchSourceFileSystemObject?
+    private var watchedOpenCodePath: String?
+    private var isRefreshing = false
+    private var refreshAgainAfterCurrent = false
 
     init(store: UsageStore, mode: Mode) {
         self.store = store
@@ -1692,6 +2206,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         } else {
             installControlStripItem()
         }
+        updateCodexSessionWatcher()
+        updateOpenCodeDBWatcher()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
@@ -1706,6 +2222,8 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     func stop() {
         timer?.invalidate()
         timer = nil
+        teardownCodexSessionWatcher()
+        teardownOpenCodeDBWatcher()
         teardownControlStripItem()
     }
 
@@ -1970,18 +2488,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
             if let snapshot, snapshot.error == nil {
                 let dailyReset = UsageFormat.resetText(snapshot.dailyResetAt)
-                row.addArrangedSubview(bar(
-                    caption: "5h",
-                    percent: snapshot.dailyPercent,
-                    trailing: UsageFormat.percentText(snapshot.dailyPercent),
-                    reset: dailyReset == "—" ? nil : dailyReset
-                ))
-                let weeklyReset = UsageFormat.resetText(snapshot.weeklyResetAt)
-                row.addArrangedSubview(bar(
-                    caption: "Wk",
-                    percent: snapshot.weeklyPercent,
-                    trailing: UsageFormat.percentText(snapshot.weeklyPercent),
-                    reset: weeklyReset == "—" ? nil : weeklyReset
+                row.addArrangedSubview(stackedBar(
+                    primaryPercent: snapshot.dailyPercent,
+                    primaryTrailing: UsageFormat.percentText(snapshot.dailyPercent),
+                    primaryReset: dailyReset == "—" ? nil : dailyReset,
+                    secondaryPercent: snapshot.weeklyPercent,
+                    secondaryTrailing: UsageFormat.percentText(snapshot.weeklyPercent)
                 ))
             } else {
                 row.addArrangedSubview(label(snapshot?.error ?? "—", color: .systemOrange, bold: false, size: 10))
@@ -2069,6 +2581,32 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         return view
     }
 
+    /// Compact two-bar gauge used per-provider in the Touch Bar detail strip:
+    /// 5h on top with the reset countdown inline, weekly on the bottom. Sizing
+    /// is intentionally driven by an explicit width so the bar track and the
+    /// inline reset text both have room to breathe; the height is fixed at the
+    /// standard 30pt Touch Bar strip.
+    private func stackedBar(
+        primaryPercent: Double?,
+        primaryTrailing: String,
+        primaryReset: String?,
+        secondaryPercent: Double?,
+        secondaryTrailing: String,
+        width: CGFloat = 130
+    ) -> StackedUsageBarView {
+        let view = StackedUsageBarView(
+            primaryPercent: primaryPercent,
+            primaryTrailing: primaryTrailing,
+            primaryReset: primaryReset,
+            secondaryPercent: secondaryPercent,
+            secondaryTrailing: secondaryTrailing
+        )
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: width).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return view
+    }
+
     private func label(_ text: String, color: NSColor, bold: Bool, size: CGFloat) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.textColor = color
@@ -2090,6 +2628,108 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         statusItem?.button?.attributedTitle = statusAttributedTitle()
         rebuildStatusMenu()
         (popover.contentViewController as? UsageViewController)?.reload()
+    }
+
+    private func updateCodexSessionWatcher() {
+        guard let url = CodexUsageCollector.newestSessionFile() else {
+            teardownCodexSessionWatcher()
+            return
+        }
+
+        let path = url.path
+        // Even when the path hasn't changed, an atomic rename (write-tmp +
+        // rename) replaces the inode behind the path. Re-watch whenever the
+        // inode or mtime drifts, otherwise our old fd is silently stale and
+        // new token_count events never trigger a refresh.
+        let identity = fileIdentity(path: path)
+        if path == watchedCodexSessionPath, let (inode, mtime) = identity,
+           inode == watchedCodexInode, mtime == watchedCodexMTime {
+            return
+        }
+
+        teardownCodexSessionWatcher()
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .attrib, .delete, .rename, .revoke],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            self?.refresh()
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        codexWatcher = source
+        watchedCodexSessionPath = path
+        if let (inode, mtime) = identity {
+            watchedCodexInode = inode
+            watchedCodexMTime = mtime
+        } else {
+            watchedCodexInode = 0
+            watchedCodexMTime = .distantPast
+        }
+        source.resume()
+    }
+
+    private func teardownCodexSessionWatcher() {
+        codexWatcher?.cancel()
+        codexWatcher = nil
+        watchedCodexSessionPath = nil
+        watchedCodexInode = 0
+        watchedCodexMTime = .distantPast
+    }
+
+    /// Watches OpenCode's SQLite database (preferring the WAL) so any new
+    /// message row — and the corresponding token deltas — surface on the
+    /// Touch Bar within ~1s of being committed, instead of waiting for the
+    /// 20-second poll.
+    private func updateOpenCodeDBWatcher() {
+        guard let path = OpenCodeUsageCollector.watchableDBPath() else {
+            teardownOpenCodeDBWatcher()
+            return
+        }
+        guard path != watchedOpenCodePath else { return }
+
+        teardownOpenCodeDBWatcher()
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .attrib, .delete, .rename, .revoke],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            self?.refresh()
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        openCodeWatcher = source
+        watchedOpenCodePath = path
+        source.resume()
+    }
+
+    private func teardownOpenCodeDBWatcher() {
+        openCodeWatcher?.cancel()
+        openCodeWatcher = nil
+        watchedOpenCodePath = nil
+    }
+
+    /// Returns `(inode, mtime)` for a path so callers can detect when the
+    /// file at a stable path has been atomically replaced (different inode
+    /// or mtime) and therefore needs its watcher re-installed.
+    private func fileIdentity(path: String) -> (inode: UInt64, mtime: Date)? {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        let mtime = Date(
+            timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec)
+                + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
+        )
+        return (UInt64(st.st_ino), mtime)
     }
 
     @objc private func refreshButtonPressed() {
@@ -2307,13 +2947,14 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
             fraction: 1
         )
 
-        // Name in labelColor with a small accent underline for provider identity.
+        // Name in labelColor with a small accent dot for provider identity.
         let nameAttrs: [NSAttributedString.Key: Any] = [
             .foregroundColor: NSColor.labelColor,
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
         ]
         let hasUsage = snapshot != nil && snapshot?.error == nil
         let dailyPercent = hasUsage ? snapshot?.dailyPercent : nil
+        let weeklyPercent = hasUsage ? snapshot?.weeklyPercent : nil
         let usageColor: NSColor = hasUsage
             ? UsageFormat.color(forPercent: dailyPercent ?? 0)
             : .systemGray
@@ -2326,6 +2967,12 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
         let weekAttrs: [NSAttributedString.Key: Any] = [
             .foregroundColor: NSColor.secondaryLabelColor,
             .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        ]
+        // Tiny reset caption drawn next to the big 5h percent, matching the
+        // StackedUsageBarView's inline-reset treatment in the system-modal bar.
+        let resetAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.tertiaryLabelColor.withAlphaComponent(0.85),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .regular)
         ]
 
         let textX: CGFloat = 27
@@ -2343,10 +2990,30 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
 
         let usage = usageText as NSString
         let usageSize = usage.size(withAttributes: usageAttrs)
-        usage.draw(at: NSPoint(x: width - usageSize.width - 2, y: 10), withAttributes: usageAttrs)
+
+        // Inline 5h reset (e.g. "↻ 2h 14m") tucked to the left of the big
+        // 5-hour percent. We only draw it when there's both a reset time and
+        // enough room — a short slot still shows the percent, which is the
+        // number the user actually watches.
+        var rightEdge = width - 2
+        if hasUsage,
+           let dailyReset = snapshot?.dailyResetAt {
+            let resetText = UsageFormat.resetText(dailyReset)
+            if resetText != "—" && resetText != "now" {
+                let text = "↻ \(resetText)" as NSString
+                let size = text.size(withAttributes: resetAttrs)
+                let x = rightEdge - usageSize.width - size.width - 4
+                if x > textX + nameSize.width + 18 {
+                    text.draw(at: NSPoint(x: x, y: 17), withAttributes: resetAttrs)
+                    rightEdge = x
+                }
+            }
+        }
+
+        usage.draw(at: NSPoint(x: rightEdge - usageSize.width, y: 10), withAttributes: usageAttrs)
 
         // Bottom line: a visible 5-hour usage bar + weekly percentage on the right.
-        let weeklyText = "W \(UsageFormat.percentText(hasUsage ? snapshot?.weeklyPercent : nil))" as NSString
+        let weeklyText = "W \(UsageFormat.percentText(weeklyPercent))" as NSString
         let weeklySize = weeklyText.size(withAttributes: weekAttrs)
         weeklyText.draw(at: NSPoint(x: width - weeklySize.width - 2, y: 1.5), withAttributes: weekAttrs)
 
@@ -2494,10 +3161,23 @@ final class TouchBarController: NSObject, NSTouchBarDelegate {
     }
 
     private func refresh() {
+        if isRefreshing {
+            refreshAgainAfterCurrent = true
+            return
+        }
+
+        isRefreshing = true
         Task {
             _ = await store.refresh()
             await MainActor.run {
                 self.refreshTouchBar()
+                self.updateCodexSessionWatcher()
+                self.updateOpenCodeDBWatcher()
+                self.isRefreshing = false
+                if self.refreshAgainAfterCurrent {
+                    self.refreshAgainAfterCurrent = false
+                    self.refresh()
+                }
             }
         }
     }
