@@ -3593,7 +3593,7 @@ app.run()
 /// usage, not have the AppKit app spawn.
 private func shouldRunCLI(_ command: CLI.Command) -> Bool {
     switch command {
-    case .status, .watch, .providers, .refresh:
+    case .status, .watch, .providers, .refresh, .start, .stop:
         return true
     case .help(let wasExplicit):
         return wasExplicit
@@ -3602,32 +3602,30 @@ private func shouldRunCLI(_ command: CLI.Command) -> Bool {
 
 /// `true` iff the parsed command should additionally start the Touch Bar
 /// accessory. Only meaningful for subcommands the user can actually pair
-/// with the Touch Bar — `providers` and `help` are excluded because they
-/// are static and don't drive the controller.
+/// with the Touch Bar — `providers`, `help`, `start`, and `stop` are
+/// excluded because they are static and don't drive the controller.
 private func commandWantsTouchBar(_ command: CLI.Command) -> Bool {
     switch command {
     case .status(_, _, _, let withTouchBar),
          .watch(_, _, let withTouchBar),
          .refresh(_, let withTouchBar):
         return withTouchBar
-    case .help, .providers:
+    case .help, .providers, .start, .stop:
         return false
     }
 }
 
 /// Rewrites `usage-touchbar --touchbar` (or `-t`) into the equivalent of
-/// `usage-touchbar watch --touchbar`. Lets the user launch the
-/// Touch-Bar-plus-silent-live-loop with a single short command, which is
-/// the friendly default for both Homebrew users and ad-hoc terminal
-/// sessions. Other subcommands (`status`, `refresh`, `watch`,
-/// `providers`, `help`) are passed through untouched.
+/// `usage-touchbar start`. Lets the user launch the background daemon with
+/// a single short command. Other subcommands (`status`, `refresh`, `watch`,
+/// `providers`, `help`, `start`, `stop`) are passed through untouched.
 private func liteCommandIfBareFlag(_ command: CLI.Command) -> CLI.Command {
     if case .help(let wasExplicit) = command, !wasExplicit {
         // Bare invocation (no subcommand) — the CLI parser doesn't
         // distinguish "no args" from "only --touchbar" here, so we sniff
-        // argv directly to detect the lite-mode shortcut.
+        // argv directly to detect the daemon shortcut.
         if CommandLine.arguments.contains("--touchbar") || CommandLine.arguments.contains("-t") {
-            return .watch(interval: 5, json: false, withTouchBar: true)
+            return .start(interval: 5)
         }
     }
     return command

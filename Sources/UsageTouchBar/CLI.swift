@@ -8,8 +8,14 @@ import Foundation
 /// provider data the Touch Bar would show, without booting AppKit or a
 /// `NSApplication` run loop:
 ///
+/// * `usage-touchbar start`      — forks the Touch Bar + silent live loop
+///                                 into the background. Terminal returns
+///                                 immediately; Touch Bar stays alive until
+///                                 `usage-touchbar stop` is run.
+/// * `usage-touchbar stop`       — gracefully stops the background daemon
+///                                 and removes the PID file.
 /// * `usage-touchbar status`     — one-shot, ANSI-colored table, exits.
-/// * `usage-touchbar watch`      — live TUI, redraws in place on each tick.
+/// * `usage-touchbar watch`      — foreground silent live loop; exits on ^C.
 /// * `usage-touchbar refresh`    — same as `status` but always re-fetches
 ///                                 network providers (bypasses the 5-minute
 ///                                 live-API cache).
@@ -34,6 +40,8 @@ enum CLI {
         case providers(json: Bool)
         case refresh(json: Bool, withTouchBar: Bool)
         case watch(interval: Int, json: Bool, withTouchBar: Bool)
+        case start(interval: Int)
+        case stop
     }
 
     static func parse(_ arguments: [String]) -> Command {
@@ -71,6 +79,10 @@ enum CLI {
                 json: hasFlag(rest, "--json"),
                 withTouchBar: touchBar
             )
+        case "start":
+            return .start(interval: flagInt(rest, "--interval", "-i") ?? 5)
+        case "stop":
+            return .stop
         case "providers":
             return .providers(json: hasFlag(rest, "--json"))
         case "refresh":
@@ -105,27 +117,29 @@ enum CLI {
 
         USAGE
           usage-touchbar                       Launch the Touch Bar accessory (default)
-          usage-touchbar --touchbar            Lite mode: Touch Bar + silent live loop
+          usage-touchbar start                 Start daemon in background; close terminal
+          usage-touchbar --touchbar            Same as `start` (friendly shortcut)
+          usage-touchbar stop                  Gracefully stop the background daemon
           usage-touchbar status                One-shot, ANSI-colored provider usage
-          usage-touchbar watch                 Silent live refresh; pair with --touchbar
+          usage-touchbar watch                 Silent foreground live loop; ^C to exit
           usage-touchbar refresh               One-shot, bypasses the live-API cache
           usage-touchbar providers             List providers + login state
           usage-touchbar help                  This message
 
         OPTIONS
-          --interval <seconds>, -i             Refresh period for `watch` (default 5)
+          --interval <seconds>, -i             Refresh period for `watch`/`start` (default 5)
                                                For `status`, defaults to one-shot.
           --json                               Emit machine-readable JSON
           --once                               Same as default for `status`; explicit
-          --touchbar, -t                       Also start the Touch Bar accessory so
-                                               you can see the data on the Touch Bar
-                                               while the CLI runs
+          --touchbar, -t                       Also start the Touch Bar accessory (implied
+                                               by `start`; optional for `status`/`refresh`)
 
         EXAMPLES
-          usage-touchbar --touchbar
+          usage-touchbar --touchbar            # Start daemon, close terminal
+          usage-touchbar stop                  # Stop the daemon
+          usage-touchbar start --interval 10   # Start with 10s refresh interval
           usage-touchbar status
           usage-touchbar status --json | jq '.[] | select(.provider == "OpenCode")'
-          usage-touchbar watch --interval 5 --touchbar
         """
         print(text)
     }
@@ -154,11 +168,12 @@ enum CLI {
         case .status(let interval, let json, let once, _):
             await statusLoop(interval: interval, json: json, once: once || interval == 0)
         case .watch(let interval, let json, _):
-            // Per the user's preference, `watch` is silent — it refreshes
-            // the snapshot in the background and the Touch Bar / `--touchbar`
-            // is the only surface. Without `--touchbar` it's a no-op that
-            // exits on SIGINT.
+            // Silent foreground live loop; user presses ^C to exit.
             await watchLoopSilent(interval: interval, json: json)
+        case .start(let interval):
+            startDaemon(interval: interval)
+        case .stop:
+            stopDaemon()
         case .refresh(let json, _):
             UsageStore.flushLiveCaches()
             await statusLoop(interval: 0, json: json, once: true)
@@ -266,6 +281,160 @@ enum CLI {
     /// queue serializes those accesses, and we use `nonisolated(unsafe)` so
     /// the `static var` satisfies the concurrency checker.
     nonisolated(unsafe) private static var stopRequested = false
+
+    // MARK: - Daemon (start / stop)
+
+    /// Path to the PID file that tracks the background daemon.
+    /// `~/.config/usage-touchbar/daemon.pid`.
+    static var daemonPIDPath: String {
+        DataFiles.expand("~/.config/usage-touchbar/daemon.pid")
+    }
+
+    /// Reads the daemon PID file and returns `(pid, nil)` if a process with
+    /// that PID is alive and is a `usage-touchbar` binary. Returns `(0,
+    /// errorMessage)` if the PID file is absent, the process is dead, or
+    /// the PID didn't belong to `usage-touchbar`.
+    static func daemonPID() -> (pid: pid_t, message: String?) {
+        let path = daemonPIDPath
+        guard FileManager.default.fileExists(atPath: path) else {
+            return (0, "No daemon is running (PID file missing)")
+        }
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8),
+              let pid = pid_t(content.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0 else {
+            // Stale / corrupted PID file — clean it up.
+            try? FileManager.default.removeItem(atPath: path)
+            return (0, "Stale PID file removed — daemon was not running")
+        }
+        // /proc is Linux-only; on macOS we use `kill -0` to check liveness
+        // and then `proc_pidpath` or a simpler `pgrep -P` style check.
+        // `kill(pid, 0)` returns 0 if the process is alive (no signal sent).
+        if kill(pid, 0) != 0 {
+            try? FileManager.default.removeItem(atPath: path)
+            return (0, "Stale PID file removed — daemon was not running")
+        }
+        return (pid, nil)
+    }
+
+    /// Writes `pid` to the daemon PID file, creating the parent directory
+    /// if needed. Returns `true` on success.
+    @discardableResult
+    static func writeDaemonPID(_ pid: pid_t) -> Bool {
+        let path = daemonPIDPath
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true
+        )
+        do {
+            try "\(pid)\n".write(toFile: path, atomically: true, encoding: .utf8)
+            return true
+        } catch {
+            FileHandle.standardError.write(
+                Data("Failed to write PID file at \(path): \(error)\n".utf8)
+            )
+            return false
+        }
+    }
+
+    /// Removes the daemon PID file. Safe to call even when the file doesn't
+    /// exist.
+    static func removeDaemonPID() {
+        try? FileManager.default.removeItem(atPath: daemonPIDPath)
+    }
+
+    /// Forks the current process: the parent exits immediately (the terminal
+    /// gets its prompt back), and the child calls `execve(...)` to replace
+    /// itself with a fresh `usage-touchbar` invocation that runs
+    /// `watch --touchbar --interval <interval>` in the foreground (which
+    /// the entry point routes to the `--touchbar` AppKit path). The child
+    /// writes its PID before the exec so `stop` can find it later.
+    ///
+    /// This is intentionally a `fork` + `exec` rather than `posix_spawn`
+    /// or `NSProcess` because the child needs the same environment
+    /// (Xcode toolchain, PATH, SwiftPM runtime) that the user built or
+    /// installed with. `exec`ing the exact binary path preserves all of
+    /// that.
+    static func startDaemon(interval: Int) {
+        let (existingPID, msg) = daemonPID()
+        if existingPID > 0 {
+            print("usage-touchbar daemon is already running (PID \(existingPID)).")
+            print("Stop it with: usage-touchbar stop")
+            return
+        }
+        if let msg {
+            print("warning: \(msg) — starting fresh daemon.")
+        }
+
+        // Resolve the binary we are currently running as. For a release
+        // install this is /opt/homebrew/bin/usage-touchbar; for a debug
+        // build it's .build/debug/usage-touchbar. We pass `--no-fork` to
+        // the child so it runs the watch loop directly instead of forking
+        // again (which would be infinite).
+        var pathBuffer = [Int8](repeating: 0, count: Int(PATH_MAX))
+        _ = pathBuffer.withUnsafeMutableBufferPointer { buf in
+            proc_pidpath(getpid(), buf.baseAddress, UInt32(buf.count))
+        }
+        let binaryPath = String(cString: pathBuffer)
+
+        let childPID = fork()
+        if childPID < 0 {
+            FileHandle.standardError.write(
+                Data("fork failed: \(String(cString: strerror(errno)))\n".utf8)
+            )
+            return
+        }
+
+        if childPID == 0 {
+            // Child: close stdin/stdout/stderr so it's totally detached.
+            // (We keep the Touch Bar connection which is via Mach ports,
+            // not file descriptors.)
+            close(STDIN_FILENO)
+            close(STDOUT_FILENO)
+            close(STDERR_FILENO)
+
+            // exec into a fresh instance of ourselves with `--no-fork` so
+            // the child process runs the AppKit loop directly. The `--`
+            // ensures flags are not interpreted as SwiftPM args.
+            let args = [
+                binaryPath,
+                "watch", "--touchbar",
+                "--interval", "\(interval)",
+                "--no-fork"
+            ]
+            let argv = args.map { strdup($0) }
+            // execvp searches PATH; execv uses absolute path.
+            execv(binaryPath, argv)
+            // If we get here, exec failed.
+            _exit(1)
+        }
+
+        // Parent: write the PID, print confirmation, exit.
+        writeDaemonPID(childPID)
+        print("usage-touchbar daemon started (PID \(childPID)).")
+        print("  The Touch Bar is now live — you can close this terminal.")
+        print("  Stop it with: usage-touchbar stop")
+    }
+
+    /// Sends SIGINT to the daemon (if running) and removes the PID file.
+    /// The daemon's `stopRequested` flag flips, the AppKit run loop exits,
+    /// and the Control Strip item uninstalls. Clean exit every time.
+    static func stopDaemon() {
+        let (pid, msg) = daemonPID()
+        guard pid > 0 else {
+            print(msg ?? "No daemon is running.")
+            return
+        }
+        print("Stopping daemon (PID \(pid))…")
+        if kill(pid, SIGINT) != 0 {
+            let err = String(cString: strerror(errno))
+            print("warning: could not signal daemon: \(err)")
+        }
+        removeDaemonPID()
+        // Give the daemon a moment to uninstall the Control Strip item
+        // and clean up its watchers before we exit.
+        Thread.sleep(forTimeInterval: 0.5)
+        print("Daemon stopped.")
+    }
 
     /// Flips `stopRequested` so the live loop exits on its next tick.
     /// Safe to call from a signal handler because the underlying storage is
