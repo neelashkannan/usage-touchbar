@@ -45,10 +45,16 @@ enum CLI {
         let rest = Array(args.dropFirst())
         let touchBar = hasFlag(rest, "--touchbar") || hasFlag(rest, "-t")
 
-        switch sub {
-        case "":
-            // No subcommand — caller launches the Touch Bar app.
+        // `usage-touchbar --touchbar` / `-t` (no subcommand, just a flag)
+        // is the lite-mode shortcut. The main entry point promotes it to
+        // a `watch --touchbar` with a 5s default interval, but parsing
+        // it here lets us recognize it as a valid invocation that does
+        // not print "Unknown command: --touchbar".
+        if sub.isEmpty || sub.hasPrefix("-") {
             return .help(wasExplicit: false)
+        }
+
+        switch sub {
         case "touchbar", "gui", "app":
             // Explicit "launch the Touch Bar app" — same as no subcommand.
             return .help(wasExplicit: false)
@@ -99,6 +105,7 @@ enum CLI {
 
         USAGE
           usage-touchbar                       Launch the Touch Bar accessory (default)
+          usage-touchbar --touchbar            Lite mode: Touch Bar + silent live loop
           usage-touchbar status                One-shot, ANSI-colored provider usage
           usage-touchbar watch                 Silent live refresh; pair with --touchbar
           usage-touchbar refresh               One-shot, bypasses the live-API cache
@@ -115,6 +122,7 @@ enum CLI {
                                                while the CLI runs
 
         EXAMPLES
+          usage-touchbar --touchbar
           usage-touchbar status
           usage-touchbar status --json | jq '.[] | select(.provider == "OpenCode")'
           usage-touchbar watch --interval 5 --touchbar

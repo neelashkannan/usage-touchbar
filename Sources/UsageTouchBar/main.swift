@@ -3527,6 +3527,8 @@ func startTouchBarController() -> TouchBarController {
 // Entry-point dispatch.
 //
 // * `usage-touchbar` (no args)              → Touch Bar accessory (existing).
+// * `usage-touchbar --touchbar` / `-t`      → "lite" mode: Touch Bar accessory
+//                                              + silent live loop, exits on ^C.
 // * `usage-touchbar status | watch | …`     → CLI mode, no AppKit, exits.
 // * `usage-touchbar … --touchbar`           → CLI mode + Touch Bar accessory.
 // * `usage-touchbar help`                   → CLI help, exits.
@@ -3536,8 +3538,9 @@ func startTouchBarController() -> TouchBarController {
 // `--touchbar` is set, we start the Touch Bar controller ourselves and run
 // the AppKit loop alongside the CLI work.
 let parsed = CLI.parse(CommandLine.arguments)
-if shouldRunCLI(parsed) {
-    let needsTouchBar = commandWantsTouchBar(parsed)
+let effective = liteCommandIfBareFlag(parsed)
+if shouldRunCLI(effective) {
+    let needsTouchBar = commandWantsTouchBar(effective)
 
     if needsTouchBar {
         // For `--touchbar` we run the AppKit event loop alongside the CLI
@@ -3559,7 +3562,7 @@ if shouldRunCLI(parsed) {
             // (which fires on the main run loop) registers before the CLI
             // starts printing.
             try? await Task.sleep(nanoseconds: 200_000_000)
-            await CLI.run(parsed)
+            await CLI.run(effective)
             exit(0)
         }
         app.run()
@@ -3571,7 +3574,7 @@ if shouldRunCLI(parsed) {
     // (which hops off the main actor for the URLSession work) can make
     // progress.
     Task { @MainActor in
-        await CLI.run(parsed)
+        await CLI.run(effective)
         exit(0)
     }
     dispatchMain()
@@ -3610,6 +3613,24 @@ private func commandWantsTouchBar(_ command: CLI.Command) -> Bool {
     case .help, .providers:
         return false
     }
+}
+
+/// Rewrites `usage-touchbar --touchbar` (or `-t`) into the equivalent of
+/// `usage-touchbar watch --touchbar`. Lets the user launch the
+/// Touch-Bar-plus-silent-live-loop with a single short command, which is
+/// the friendly default for both Homebrew users and ad-hoc terminal
+/// sessions. Other subcommands (`status`, `refresh`, `watch`,
+/// `providers`, `help`) are passed through untouched.
+private func liteCommandIfBareFlag(_ command: CLI.Command) -> CLI.Command {
+    if case .help(let wasExplicit) = command, !wasExplicit {
+        // Bare invocation (no subcommand) — the CLI parser doesn't
+        // distinguish "no args" from "only --touchbar" here, so we sniff
+        // argv directly to detect the lite-mode shortcut.
+        if CommandLine.arguments.contains("--touchbar") || CommandLine.arguments.contains("-t") {
+            return .watch(interval: 5, json: false, withTouchBar: true)
+        }
+    }
+    return command
 }
 
 /// Lightweight `NSApplicationDelegate` used when the user runs a CLI

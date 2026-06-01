@@ -37,6 +37,38 @@ download is needed.
 
 ## Install
 
+### Option 0 — Homebrew (CLI + Touch Bar accessory)
+
+```bash
+brew install neelashkannan/tap/usage-touchbar
+```
+
+That puts `usage-touchbar` on your `PATH`. From any terminal:
+
+```bash
+# Start the Touch Bar accessory + silent live refresh loop. Press ^C to exit.
+usage-touchbar --touchbar
+
+# One-shot status print (no Touch Bar, no TUI).
+usage-touchbar status
+
+# One-shot status print + Touch Bar accessory.
+usage-touchbar status --touchbar
+
+# Machine-readable JSON for piping into `jq` or other tools.
+usage-touchbar status --json
+
+# Bypass the live-API cache and re-fetch everything.
+usage-touchbar refresh
+
+# List providers + their login state.
+usage-touchbar providers
+```
+
+Run `usage-touchbar help` for the full option list. The same binary is also
+the "Touch Bar app" — running `usage-touchbar` with no arguments starts the
+permanent-resident mode intended for the LaunchAgent (see Option B below).
+
 ### Option A — drag-to-install from the DMG
 
 ```bash
