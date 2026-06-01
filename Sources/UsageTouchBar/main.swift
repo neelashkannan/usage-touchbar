@@ -464,6 +464,16 @@ struct CodexUsageCollector: UsageCollecting {
         liveCacheAt = Date()
     }
 
+    /// Drops the in-memory live cache so the next `collect()` is forced to
+    /// hit the network. Used by the CLI `refresh` subcommand to bypass the
+    /// 30-second cache when the user wants fresh numbers.
+    static func flushLiveCache() {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveCache = nil
+        liveCacheAt = nil
+    }
+
     private struct Auth: Decodable {
         let tokens: Tokens
         struct Tokens: Decodable {
@@ -906,6 +916,16 @@ struct ClaudeUsageCollector: UsageCollecting {
         liveCacheAt = Date()
     }
 
+    /// Drops the in-memory live cache so the next `collect()` is forced to
+    /// hit the network. Used by the CLI `refresh` subcommand to bypass the
+    /// 5-minute cache when the user wants fresh numbers.
+    static func flushLiveCache() {
+        liveCacheLock.lock()
+        defer { liveCacheLock.unlock() }
+        liveCache = nil
+        liveCacheAt = nil
+    }
+
     func collect() async -> UsageSnapshot {
         guard AuthDetector.current().isConnected(.claude) else {
             return .disconnected(.claude)
@@ -1135,10 +1155,50 @@ struct OpenCodeUsageCollector: UsageCollecting {
         var total: Int { input + output + reasoning + cacheRead + cacheWrite }
     }
 
+    /// In-memory cache of the most recent snapshot. The DB query takes
+    /// single-digit milliseconds, but the filesystem watcher can fire several
+    /// times per second during a heavy write burst — debouncing the read
+    /// keeps the Touch Bar from re-deriving the same numbers on every event
+    /// while still surfacing fresh data within five seconds.
+    private static let cacheLock = NSLock()
+    private nonisolated(unsafe) static var cachedSnapshot: UsageSnapshot?
+    private nonisolated(unsafe) static var cachedAt: Date?
+    private static let cacheMinInterval: TimeInterval = 5
+
+    private static func freshCachedSnapshot() -> UsageSnapshot? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let snapshot = cachedSnapshot, let at = cachedAt,
+              Date().timeIntervalSince(at) < cacheMinInterval else { return nil }
+        return snapshot
+    }
+
+    private static func storeCachedSnapshot(_ snapshot: UsageSnapshot) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        cachedSnapshot = snapshot
+        cachedAt = Date()
+    }
+
+    /// Drops the OpenCode snapshot cache so the next `collect()` re-reads the
+    /// SQLite database. Mirrors `flushLiveCache` on the network collectors and
+    /// is what the CLI `refresh` subcommand invokes.
+    static func flushLiveCache() {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        cachedSnapshot = nil
+        cachedAt = nil
+    }
+
     func collect() async -> UsageSnapshot {
         guard AuthDetector.current().isConnected(.opencode) else {
             return .disconnected(.opencode)
         }
+        // Cheap re-derive: serves the previous snapshot (which already
+        // reflects the last DB read) immediately so the Touch Bar can redraw
+        // without waiting on the disk.
+        if let cached = Self.freshCachedSnapshot() { return cached }
+
         guard let dbPath = dbPaths
             .map({ DataFiles.expand($0) })
             .first(where: { FileManager.default.fileExists(atPath: $0) }) else {
@@ -1164,7 +1224,7 @@ struct OpenCodeUsageCollector: UsageCollecting {
         let dailyPercent = min(100, Double(fiveHour.total) / Double(fiveHourTokenBudget) * 100)
         let weeklyPercent = min(100, Double(weekly.total) / Double(weeklyTokenBudget) * 100)
 
-        return UsageSnapshot(
+        let snapshot = UsageSnapshot(
             provider: .opencode,
             isConnected: true,
             dailyPercent: dailyPercent,
@@ -1176,6 +1236,8 @@ struct OpenCodeUsageCollector: UsageCollecting {
             updatedAt: weekly.latest ?? Date(),
             error: nil
         )
+        Self.storeCachedSnapshot(snapshot)
+        return snapshot
     }
 
     /// Opens the DB read-only, runs a single query that returns both windows
@@ -3434,14 +3496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // One single app/process: all providers are shown together in one
         // Control Strip slot. (The legacy `--agent` multi-process mode that
         // produced separate binaries — and separate Keychain prompts — is gone.)
-        let collectors: [UsageCollecting] = [
-            ClaudeUsageCollector(),
-            CodexUsageCollector(),
-            OpenCodeUsageCollector()
-        ]
-        let controller = TouchBarController(store: UsageStore(collectors: collectors), mode: .launcher)
-        self.controller = controller
-        controller.start()
+        self.controller = MainActor.assumeIsolated { startTouchBarController() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -3453,8 +3508,131 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Builds, starts, and returns a Touch Bar controller. Used by both the
+/// `AppDelegate` (the default no-arg / Touch Bar app path) and the CLI when
+/// the user passes `--touchbar` to also see the accessory while the CLI is
+/// running. The controller installs its Control Strip item, schedules its
+/// 20s refresh timer, and attaches the file-system watchers — none of which
+/// need an `NSApplication.run()` until the host actually calls it.
+@MainActor
+func startTouchBarController() -> TouchBarController {
+    let controller = TouchBarController(
+        store: UsageStore(collectors: CLI.defaultCollectors()),
+        mode: .launcher
+    )
+    controller.start()
+    return controller
+}
+
+// Entry-point dispatch.
+//
+// * `usage-touchbar` (no args)              → Touch Bar accessory (existing).
+// * `usage-touchbar status | watch | …`     → CLI mode, no AppKit, exits.
+// * `usage-touchbar … --touchbar`           → CLI mode + Touch Bar accessory.
+// * `usage-touchbar help`                   → CLI help, exits.
+//
+// We inspect argv *before* touching `NSApplication.shared` so a CLI
+// subcommand without `--touchbar` never spawns the AppKit run loop. When
+// `--touchbar` is set, we start the Touch Bar controller ourselves and run
+// the AppKit loop alongside the CLI work.
+let parsed = CLI.parse(CommandLine.arguments)
+if shouldRunCLI(parsed) {
+    let needsTouchBar = commandWantsTouchBar(parsed)
+
+    if needsTouchBar {
+        // For `--touchbar` we run the AppKit event loop alongside the CLI
+        // work. The Control Strip installation (`installControlStripItem`)
+        // and the modal Touch Bar presentation both need an NSPanel, which
+        // must be created on the main thread with the AppKit run loop
+        // pumping. The cost of running the AppKit loop here is that
+        // `URLSession.shared.data(for:)` completion can take ~3× longer to
+        // fire (turning an 8s refresh into a ~25s refresh) because the
+        // run-loop mode it posts to competes with AppKit. We accept that
+        // for the one-shot case; `watch --touchbar` users typically press
+        // ^C to dismiss the live view, not wait for a one-shot to finish.
+        let app = NSApplication.shared
+        let delegate = TouchBarOnlyAppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        Task { @MainActor in
+            // Small delay so the controller's `installControlStripItem`
+            // (which fires on the main run loop) registers before the CLI
+            // starts printing.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            await CLI.run(parsed)
+            exit(0)
+        }
+        app.run()
+        exit(0)
+    }
+
+    // Pure CLI path: no AppKit, no Touch Bar. `dispatchMain()` parks the
+    // main thread on the main dispatch queue so `await store.refresh()`
+    // (which hops off the main actor for the URLSession work) can make
+    // progress.
+    Task { @MainActor in
+        await CLI.run(parsed)
+        exit(0)
+    }
+    dispatchMain()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
+
+/// `true` iff argv asked for a CLI subcommand. The bare invocation falls
+/// through to the Touch Bar app, preserving existing behavior. An explicit
+/// `usage-touchbar help` is a CLI command: we want shell users to see
+/// usage, not have the AppKit app spawn.
+private func shouldRunCLI(_ command: CLI.Command) -> Bool {
+    switch command {
+    case .status, .watch, .providers, .refresh:
+        return true
+    case .help(let wasExplicit):
+        return wasExplicit
+    }
+}
+
+/// `true` iff the parsed command should additionally start the Touch Bar
+/// accessory. Only meaningful for subcommands the user can actually pair
+/// with the Touch Bar — `providers` and `help` are excluded because they
+/// are static and don't drive the controller.
+private func commandWantsTouchBar(_ command: CLI.Command) -> Bool {
+    switch command {
+    case .status(_, _, _, let withTouchBar),
+         .watch(_, _, let withTouchBar),
+         .refresh(_, let withTouchBar):
+        return withTouchBar
+    case .help, .providers:
+        return false
+    }
+}
+
+/// Lightweight `NSApplicationDelegate` used when the user runs a CLI
+/// subcommand with `--touchbar`. It does the same job as `AppDelegate`
+/// (start the Touch Bar controller) but lives in a separate type so the
+/// CLI path doesn't carry the full default-app behavior (no menu bar item,
+/// no "Connect Accounts" window — those are owned by the no-arg Touch Bar
+/// launch and are not appropriate for a one-shot CLI invocation).
+@MainActor
+final class TouchBarOnlyAppDelegate: NSObject, NSApplicationDelegate {
+    private var controller: TouchBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        self.controller = startTouchBarController()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        controller?.stop()
+    }
+}
+
+
